@@ -1,0 +1,186 @@
+import subprocess
+import tempfile
+import os
+import random
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from supabase import Client
+from tuneapi import tu
+
+from src.db import (
+    ContentGeneration,
+    Conversation,
+)
+from src.content.image import _generate_image, CONTEMPLATION_PROMPTS
+from src.settings import get_supabase_client
+from src.db import get_db_session
+from src.content.audio import (
+    collect_source_content,
+    generate_meditation_transcript,
+    generate_audio_from_transcript,
+)
+
+
+async def generate_video_content(
+    content_id: str,
+    conversation_id: str,
+    message_id: str,
+) -> None:
+    """Background task to generate video content and update the database record"""
+
+    # Create a new database session for the background task
+    session = get_db_session()
+    spb_client = get_supabase_client()
+
+    try:
+        tu.logger.info(f"Starting background video generation for content {content_id}")
+
+        # Generate the video content
+        content_path, transcript = await generate_video_sync(
+            session=session,
+            conversation_id=conversation_id,
+            message_id=message_id,
+            spb_client=spb_client,
+            content_id=content_id,
+        )
+
+        # Update the ContentGeneration record with the results
+        query = select(ContentGeneration).where(ContentGeneration.id == content_id)
+        result = await session.execute(query)
+        content_generation = result.scalar_one_or_none()
+
+        if content_generation:
+            content_generation.content_path = content_path
+            content_generation.transcript = transcript
+            await session.commit()
+            tu.logger.info(
+                f"Successfully completed video generation for content {content_id}"
+            )
+        else:
+            tu.logger.error(f"ContentGeneration record not found for id {content_id}")
+
+    except Exception as e:
+        tu.logger.error(
+            f"Error in background video generation for content {content_id}: {e}"
+        )
+        # Could optionally update the record with an error status here
+    finally:
+        await session.close()
+
+
+async def generate_video_sync(
+    session: AsyncSession,
+    conversation_id: str,
+    message_id: str,
+    spb_client: Client,
+    content_id: str,
+) -> tuple[str, str]:
+    """Generate video content synchronously and return content_path and transcript"""
+
+    # Get the conversation to get the user_id
+    query = select(Conversation).where(Conversation.id == conversation_id)
+    result = await session.execute(query)
+    conversation = result.scalar_one_or_none()
+    if not conversation:
+        raise ValueError(f"Conversation with id {conversation_id} not found")
+
+    tu.logger.info(f"Generating video for conversation {conversation_id}/{message_id}")
+
+    # Use shared functions for content collection and transcript generation
+    source_content = await collect_source_content(session, conversation_id)
+    transcript = await generate_meditation_transcript(source_content)
+
+    # Generate audio using shared function
+    audio_bytes = await generate_audio_from_transcript(transcript)
+
+    # Step 4: Generate image for the video background
+    prompt = random.choice(CONTEMPLATION_PROMPTS)
+    pil_image = await _generate_image(prompt)
+    tu.logger.info(f"Generated image: {pil_image.size}")
+
+    # Step 5: Create video using FFmpeg
+    # Create temporary files
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as img_file:
+        pil_image.save(img_file.name, "PNG")
+        image_path = img_file.name
+
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as audio_file:
+        audio_file.write(audio_bytes)
+        audio_path = audio_file.name
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as video_file:
+        video_path = video_file.name
+
+    try:
+        # Create video with FFmpeg
+        success = create_video_ffmpeg(image_path, audio_path, video_path)
+        if not success:
+            raise Exception("FFmpeg video creation failed")
+
+        # Step 6: Upload to Supabase
+        content_path = f"meditation-videos/{content_id}.mp4"
+
+        with open(video_path, "rb") as f:
+            video_bytes = f.read()
+
+        tu.logger.info(f"Uploading video to supabase: {content_path}")
+        spb_client.storage.from_("generations").upload(
+            content_path,
+            video_bytes,
+            {"content-type": "video/mp4"},
+        )
+
+        tu.logger.info(f"Successfully created video content generation: {content_id}")
+        return content_path, transcript
+
+    finally:
+        # Step 7: Clean up temporary files
+        for temp_path in [image_path, audio_path, video_path]:
+            try:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+                    tu.logger.info(f"Cleaned up temporary file: {temp_path}")
+            except Exception as e:
+                tu.logger.warning(f"Failed to cleanup {temp_path}: {e}")
+
+
+def create_video_ffmpeg(
+    image_path: str,
+    audio_path: str,
+    output_path: str,
+):
+    """
+    Create video from image and audio using FFmpeg
+    """
+    cmd = [
+        "ffmpeg",
+        "-loop",
+        "1",  # Loop the image
+        "-i",
+        image_path,  # Input image
+        "-i",
+        audio_path,  # Input audio
+        "-c:v",
+        "libx264",  # Video codec
+        "-tune",
+        "stillimage",  # Optimize for still images
+        "-c:a",
+        "aac",  # Audio codec
+        "-b:a",
+        "192k",  # Audio bitrate
+        "-pix_fmt",
+        "yuv420p",  # Pixel format for compatibility
+        "-shortest",  # Stop when shortest input ends
+        "-y",  # Overwrite output file
+        output_path,
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        print(f"Video created successfully: {output_path}")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Error: {e}")
+        print(f"FFmpeg output: {e.stderr}")
+        return False

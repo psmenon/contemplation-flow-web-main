@@ -1,0 +1,46 @@
+[project]
+name = "contemplation-flow-web"
+version = "0.1.2"
+description = "Project अर्थ"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Yash Bonde", email = "bonde.yash97@gmail.com" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+]
+keywords = ["sanskrit", "nlp", "language-processing"]
+dependencies = [
+    "alembic>=1.16.1",
+    "asyncpg>=0.30.0",
+    "fastapi>=0.115.12",
+    "fire>=0.7.0",
+    "greenlet>=3.2.2",
+    "jinja2>=3.1.0",
+    "psycopg2-binary>=2.9.10",
+    "pydantic-settings>=2.9.1",
+    "python-dotenv>=1.1.0",
+    "sqlalchemy>=2.0.41",
+    "starlette-context>=0.4.0",
+    "twine>=6.1.0",
+    "uvicorn>=0.34.2",
+    "pgvector>=0.4.1",
+    "supabase>=2.16.0",
+    "python-multipart>=0.0.20",
+    "tuneapi==8.0.18",
+    "tiktoken>=0.9.0",
+    "pymupdf>=1.26.3",
+    "python-docx>=1.2.0",
+]
+
+# [tool.uv.source]
+# tuneapi = { url = "../../wrk/repos/tuneapi" }
+
+[project.urls]
+Homepage = "https://github.com/yashbonde/contemplation-flow-web"
+Repository = "https://github.com/yashbonde/contemplation-flow-web.git"
+Documentation = "https://github.com/yashbonde/contemplation-flow-web#readme"
