@@ -2,6 +2,7 @@ import subprocess
 import tempfile
 import os
 import random
+import asyncio
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -13,13 +14,14 @@ from src.db import (
     Conversation,
 )
 from src.content.image import _generate_image, CONTEMPLATION_PROMPTS
-from src.settings import get_supabase_client
+from src.settings import get_supabase_client, get_llm
 from src.db import get_db_session
 from src.content.audio import (
     collect_source_content,
     generate_meditation_transcript,
     generate_audio_from_transcript,
 )
+from src.content.parallel_video import parallel_generator
 
 
 async def generate_video_content(
@@ -36,8 +38,8 @@ async def generate_video_content(
     try:
         tu.logger.info(f"Starting background video generation for content {content_id}")
 
-        # Generate the video content
-        content_path, transcript = await generate_video_sync(
+        # Generate the video content using parallel processing
+        content_path, transcript = await generate_video_parallel(
             session=session,
             conversation_id=conversation_id,
             message_id=message_id,
@@ -69,40 +71,102 @@ async def generate_video_content(
         await session.close()
 
 
-async def generate_video_sync(
+async def generate_video_parallel(
     session: AsyncSession,
     conversation_id: str,
     message_id: str,
     spb_client: Client,
     content_id: str,
 ) -> tuple[str, str]:
-    """Generate video content synchronously and return content_path and transcript"""
-
-    # Get the conversation to get the user_id
+    """Generate video content with parallel processing for maximum speed"""
+    
+    tu.logger.info(f"Starting parallel video generation for {content_id}")
+    
+    # Step 1: Get conversation and start source content collection
     query = select(Conversation).where(Conversation.id == conversation_id)
     result = await session.execute(query)
     conversation = result.scalar_one_or_none()
     if not conversation:
         raise ValueError(f"Conversation with id {conversation_id} not found")
 
-    tu.logger.info(f"Generating video for conversation {conversation_id}/{message_id}")
+    # Step 2: Start source content collection and image generation in parallel
+    source_content_task = collect_source_content(session, conversation_id)
+    image_task = _generate_image_parallel()
+    
+    # Step 3: Wait for source content, then start transcript generation
+    source_content = await source_content_task
+    transcript_task = generate_meditation_transcript(source_content)
+    
+    # Step 4: Wait for transcript, then start audio generation
+    transcript = await transcript_task
+    audio_task = generate_audio_from_transcript(transcript)
+    
+    # Step 5: Wait for image and audio to complete in parallel
+    image, audio_bytes = await asyncio.gather(
+        image_task,
+        audio_task,
+        return_exceptions=True
+    )
+    
+    # Handle exceptions
+    if isinstance(image, Exception):
+        tu.logger.error(f"Image generation failed: {image}")
+        raise image
+    if isinstance(audio_bytes, Exception):
+        tu.logger.error(f"Audio generation failed: {audio_bytes}")
+        raise audio_bytes
+    
+    # Step 6: Create video with optimized FFmpeg
+    video_path = await _create_video_optimized(image, audio_bytes)
+    
+    # Step 7: Upload to Supabase
+    content_path = f"meditation-videos/{content_id}.mp4"
+    with open(video_path, "rb") as f:
+        video_bytes = f.read()
+    
+    tu.logger.info(f"Uploading video to supabase: {content_path}")
+    spb_client.storage.from_("generations").upload(
+        content_path,
+        video_bytes,
+        {"content-type": "video/mp4"},
+    )
+    
+    # Cleanup
+    try:
+        os.unlink(video_path)
+    except Exception as e:
+        tu.logger.warning(f"Failed to cleanup video temp file: {e}")
+    
+    tu.logger.info(f"Successfully completed parallel video generation: {content_id}")
+    return content_path, transcript
 
-    # Use shared functions for content collection and transcript generation
-    source_content = await collect_source_content(session, conversation_id)
-    transcript = await generate_meditation_transcript(source_content)
 
-    # Generate audio using shared function
-    audio_bytes = await generate_audio_from_transcript(transcript)
-
-    # Step 4: Generate image for the video background
+async def _generate_image_parallel():
+    """Generate image with optimized settings for speed"""
+    model = get_llm("gpt-4o")
     prompt = random.choice(CONTEMPLATION_PROMPTS)
-    pil_image = await _generate_image(prompt)
-    tu.logger.info(f"Generated image: {pil_image.size}")
+    
+    tu.logger.info(f"Generating image with prompt: {prompt}")
+    img_gen_response = await model.image_gen_async(
+        prompt=prompt,
+        n=1,
+        size="1024x1024",  # Smaller size for faster generation
+        quality="standard",
+    )
+    
+    tu.logger.info(f"Generated image: {img_gen_response.image.size}")
+    return img_gen_response.image
 
-    # Step 5: Create video using FFmpeg
+
+async def _create_video_optimized(
+    image,
+    audio_bytes: bytes,
+) -> str:
+    """Create video with optimized FFmpeg settings"""
+    
     # Create temporary files
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as img_file:
-        pil_image.save(img_file.name, "PNG")
+        image.save(img_file.name, "PNG")
         image_path = img_file.name
 
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as audio_file:
@@ -113,36 +177,98 @@ async def generate_video_sync(
         video_path = video_file.name
 
     try:
-        # Create video with FFmpeg
-        success = create_video_ffmpeg(image_path, audio_path, video_path)
+        # Optimized FFmpeg command
+        success = _create_video_ffmpeg_optimized(
+            image_path, audio_path, video_path
+        )
         if not success:
             raise Exception("FFmpeg video creation failed")
-
-        # Step 6: Upload to Supabase
-        content_path = f"meditation-videos/{content_id}.mp4"
-
-        with open(video_path, "rb") as f:
-            video_bytes = f.read()
-
-        tu.logger.info(f"Uploading video to supabase: {content_path}")
-        spb_client.storage.from_("generations").upload(
-            content_path,
-            video_bytes,
-            {"content-type": "video/mp4"},
-        )
-
-        tu.logger.info(f"Successfully created video content generation: {content_id}")
-        return content_path, transcript
-
+        
+        return video_path
+        
     finally:
-        # Step 7: Clean up temporary files
-        for temp_path in [image_path, audio_path, video_path]:
+        # Cleanup temp files
+        for temp_path in [image_path, audio_path]:
             try:
                 if os.path.exists(temp_path):
                     os.unlink(temp_path)
-                    tu.logger.info(f"Cleaned up temporary file: {temp_path}")
             except Exception as e:
                 tu.logger.warning(f"Failed to cleanup {temp_path}: {e}")
+
+
+def _create_video_ffmpeg_optimized(
+    image_path: str,
+    audio_path: str,
+    output_path: str,
+) -> bool:
+    """Optimized FFmpeg command for faster video creation"""
+    
+    # Check for hardware acceleration
+    hw_accel = "-hwaccel auto" if _check_hardware_acceleration() else ""
+    
+    # Optimized settings for faster encoding
+    cmd = [
+        "ffmpeg",
+        "-y",  # Overwrite output
+        hw_accel,
+        "-loop", "1",  # Loop image
+        "-i", image_path,
+        "-i", audio_path,
+        "-c:v", "libx264",  # Video codec
+        "-preset", "ultrafast",  # Fastest encoding
+        "-crf", "23",  # Good quality
+        "-c:a", "aac",  # Audio codec
+        "-b:a", "128k",  # Audio bitrate
+        "-shortest",  # End when audio ends
+        "-movflags", "+faststart",  # Web optimization
+        output_path
+    ]
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minute timeout
+        )
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        tu.logger.error("FFmpeg timeout")
+        return False
+    except Exception as e:
+        tu.logger.error(f"FFmpeg error: {e}")
+        return False
+
+
+def _check_hardware_acceleration() -> bool:
+    """Check if hardware acceleration is available"""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "testsrc", "-f", "null", "-"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        return result.returncode == 0
+    except:
+        return False
+
+
+async def generate_video_sync(
+    session: AsyncSession,
+    conversation_id: str,
+    message_id: str,
+    spb_client: Client,
+    content_id: str,
+) -> tuple[str, str]:
+    """Generate video content using parallel processing"""
+    
+    # Use the parallel generator instead of sequential processing
+    content_path, transcript = await parallel_generator.generate_video_parallel(
+        session, conversation_id, message_id, content_id
+    )
+    
+    return content_path, transcript
 
 
 def create_video_ffmpeg(
@@ -151,7 +277,7 @@ def create_video_ffmpeg(
     output_path: str,
 ):
     """
-    Create video from image and audio using FFmpeg
+    Create video from image and audio using FFmpeg (legacy method)
     """
     cmd = [
         "ffmpeg",

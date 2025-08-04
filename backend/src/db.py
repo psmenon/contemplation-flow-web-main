@@ -1,4 +1,4 @@
-from typing import AsyncGenerator, Annotated, ClassVar, Any
+from typing import AsyncGenerator, Annotated, ClassVar, Any, Optional, List
 from tuneapi import tu, tt
 
 import datetime
@@ -24,6 +24,8 @@ from sqlalchemy import (
     Boolean,
     Integer,
     Text,
+    select,
+    and_,
 )
 from sqlalchemy.dialects.postgresql import (
     JSONB,
@@ -46,12 +48,15 @@ from sqlalchemy.orm import (
     mapped_column,
     Session,
     relationship,
+    selectinload,
 )
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy import MetaData
 
 from src.settings import settings
 from src import wire
+
+import tiktoken
 
 
 # column declarations
@@ -124,8 +129,18 @@ class PydanticList(TypeDecorator[list[tt.BM]]):
         self, value: list[tt.BM] | None, dialect: Dialect
     ) -> list[dict[str, Any]]:
         if value is None:
-            return None
-        return [item.model_dump() for item in value]
+            return []
+        
+        result = []
+        for item in value:
+            if isinstance(item, dict):
+                result.append(item)
+            elif hasattr(item, 'model_dump'):
+                result.append(item.model_dump())
+            else:
+                raise ValueError(f"Expected Pydantic model or dict, got {type(item)}")
+        
+        return result
 
     def process_result_value(
         self, value: list[dict[str, Any]] | None, dialect: Dialect
@@ -163,7 +178,17 @@ class PydanticModel(TypeDecorator[tt.BM]):
     ) -> dict[str, Any] | None:
         if value is None:
             return None
-        return value.model_dump()
+        # If it's already a dict, return it as-is
+        if isinstance(value, dict):
+            return value
+        
+        # If it's a Pydantic model, call model_dump()
+        if hasattr(value, 'model_dump'):
+            return value.model_dump()
+        
+        # Otherwise, raise an error
+        raise ValueError(f"Expected Pydantic model or dict, got {type(value)}")
+        
 
     def process_result_value(
         self,
@@ -187,7 +212,7 @@ def connect_to_postgres(sync: bool = False) -> AsyncEngine | Engine:
             echo_pool=True,
             pool_pre_ping=True,
             pool_recycle=3600,  # Recycle connections every hour
-            connect_args={"ssl": ssl_context},
+            #connect_args={"ssl": ssl_context},
         )
     return create_async_engine(
         str(settings.db_url),
@@ -195,7 +220,7 @@ def connect_to_postgres(sync: bool = False) -> AsyncEngine | Engine:
         echo_pool=True,
         pool_pre_ping=True,
         pool_recycle=3600,  # Recycle connections every hour
-        connect_args={"ssl": ssl_context},
+        #connect_args={"ssl": ssl_context},
     )
 
 
@@ -267,8 +292,19 @@ class UserProfile(Base):
     content_generations: Mapped[list["ContentGeneration"]] = relationship(
         "ContentGeneration", back_populates="user", cascade="all, delete-orphan"
     )
+    # Add this relationship
+    source_documents: Mapped[list["SourceDocument"]] = relationship(
+        "SourceDocument", back_populates="user", cascade="all, delete-orphan"
+    )
 
-    __table_args__ = ()
+    __table_args__ = (
+        # HIGH IMPACT: Phone number lookup (already unique, but explicit index)
+        Index("idx_user_profile_phone", "phone_number"),
+        # MEDIUM IMPACT: Role filtering
+        Index("idx_user_profile_role", "role"),
+        # MEDIUM IMPACT: Last active for analytics
+        Index("idx_user_profile_last_active", "last_active_at"),
+    )
 
     async def to_bm(self) -> wire.User:
         return wire.User(
@@ -325,44 +361,6 @@ class OTPSession(Base):
 # ============================================================================
 # 2. CHAT & CONVERSATIONS TABLES
 # ============================================================================
-
-
-class Conversation(Base):
-    __tablename__ = "conversations"
-
-    id: Mapped[pkey_uuid]
-    created_at: Mapped[default_timestamp]
-    updated_at: Mapped[updated_timestamp]
-    deleted_at: Mapped[datetime.datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    user_id: Mapped[fkey_uuid] = mapped_column(
-        ForeignKey("user_profiles.id", ondelete="CASCADE")
-    )
-    title: Mapped[str | None] = mapped_column(String, nullable=True)
-
-    # Relationships
-    user: Mapped["UserProfile"] = relationship(
-        "UserProfile", back_populates="conversations"
-    )
-    messages: Mapped[list["Message"]] = relationship(
-        "Message", back_populates="conversation", cascade="all, delete-orphan"
-    )
-    content_generations: Mapped[list["ContentGeneration"]] = relationship(
-        "ContentGeneration", back_populates="conversation"
-    )
-
-    __table_args__ = ()
-
-    async def to_bm(self) -> wire.Conversation:
-        return wire.Conversation(
-            id=str(self.id),
-            user_id=str(self.user_id),
-            title=self.title,
-            created_at=self.created_at,
-        )
-
-
 class MessageRole(enum.Enum):
     USER = "user"
     ASSISTANT = "assistant"
@@ -371,7 +369,6 @@ class MessageRole(enum.Enum):
 class FeedbackType(enum.Enum):
     POSITIVE = "positive"
     NEGATIVE = "negative"
-
 
 class Message(Base):
     __tablename__ = "messages"
@@ -386,6 +383,7 @@ class Message(Base):
         nullable=False,
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    # Change back to original Pydantic types
     citations: Mapped[list[wire.CitationInfo] | None] = mapped_column(
         PydanticList(wire.CitationInfo), default=list
     )
@@ -416,7 +414,16 @@ class Message(Base):
         "ContentGeneration", back_populates="message"
     )
 
-    __table_args__ = ()
+    __table_args__ = (
+        # HIGH IMPACT: Messages by conversation (most critical)
+        Index("idx_message_conversation_id", "conversation_id"),
+        # HIGH IMPACT: Messages by conversation + created_at for ordering
+        Index("idx_message_conversation_created", "conversation_id", "created_at"),
+        # MEDIUM IMPACT: Role filtering
+        Index("idx_message_role", "role"),
+        # MEDIUM IMPACT: Created at for sorting
+        Index("idx_message_created_at", "created_at"),
+    )
 
     async def to_bm(self) -> wire.Message:
         return wire.Message(
@@ -427,6 +434,47 @@ class Message(Base):
             citations=self.citations,
             follow_up_questions=self.follow_up_questions,
         )
+# Add this after the Message class (around line 410)
+
+class Conversation(Base):
+    __tablename__ = "conversations"
+
+    id: Mapped[pkey_uuid]
+    created_at: Mapped[default_timestamp]
+    updated_at: Mapped[updated_timestamp]
+    user_id: Mapped[fkey_uuid] = mapped_column(
+        ForeignKey("user_profiles.id", ondelete="CASCADE")
+    )
+    title: Mapped[str | None] = mapped_column(String, nullable=True)
+    deleted_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    # Relationships
+    user: Mapped["UserProfile"] = relationship(
+        "UserProfile", back_populates="conversations"
+    )
+    messages: Mapped[list["Message"]] = relationship(
+        "Message", back_populates="conversation", cascade="all, delete-orphan"
+    )
+    content_generations: Mapped[list["ContentGeneration"]] = relationship(
+        "ContentGeneration", back_populates="conversation", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index("idx_conversation_user_id", "user_id"),
+        Index("idx_conversation_deleted_at", "deleted_at"),
+        Index("idx_conversation_created_at", "created_at"),
+    )
+
+    async def to_bm(self) -> wire.Conversation:
+        return wire.Conversation(
+            id=str(self.id),
+            user_id=str(self.user_id),
+            title=self.title,
+            created_at=self.created_at,
+        )
+
 
 
 # ============================================================================
@@ -445,6 +493,9 @@ class SourceDocument(Base):
 
     id: Mapped[pkey_uuid]
     created_at: Mapped[default_timestamp]
+    user_id: Mapped[fkey_uuid] = mapped_column(
+        ForeignKey("user_profiles.id", ondelete="CASCADE")
+    )
     filename: Mapped[str] = mapped_column(String, nullable=False)
     file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -452,13 +503,24 @@ class SourceDocument(Base):
         pg_enum(DocumentStatus, name="document_status_enum", create_type=True),
         default=DocumentStatus.PROCESSING,
     )
+    # Relationships
+    user: Mapped["UserProfile"] = relationship(
+        "UserProfile", back_populates="source_documents"
+    )
 
     # Relationships
     chunks: Mapped[list["DocumentChunk"]] = relationship(
         "DocumentChunk", back_populates="source_document", cascade="all, delete-orphan"
     )
 
-    __table_args__ = ()
+    __table_args__ = (
+        # HIGH IMPACT: Active documents filtering
+        Index("idx_source_document_active", "active"),
+        # MEDIUM IMPACT: Status filtering
+        Index("idx_source_document_status", "status"),
+        # MEDIUM IMPACT: Created at for sorting
+        Index("idx_source_document_created_at", "created_at"),
+    )
 
     async def to_bm(self) -> wire.SourceDocument:
         return wire.SourceDocument(
@@ -481,6 +543,7 @@ class DocumentChunk(Base):
         ForeignKey("source_documents.id", ondelete="CASCADE")
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    # Restore VECTOR type for proper vector search
     embedding: Mapped[list[float]] = mapped_column(VECTOR(1536), nullable=False)
     location: Mapped[str] = mapped_column(Text, nullable=False)
     model_used: Mapped[str] = mapped_column(String, nullable=False)
@@ -490,8 +553,14 @@ class DocumentChunk(Base):
         "SourceDocument", back_populates="chunks"
     )
 
-    __table_args__ = ()
-
+    __table_args__ = (
+        # Restore vector-specific index
+        Index("idx_document_chunk_embedding", "embedding", postgresql_using="ivfflat"),
+        # HIGH IMPACT: Chunks by source document
+        Index("idx_document_chunk_source_id", "source_document_id"),
+        # MEDIUM IMPACT: Model used for filtering
+        Index("idx_document_chunk_model", "model_used"),
+    )
 
 # ============================================================================
 # 4. CONTENT GENERATION TABLES
@@ -545,7 +614,16 @@ class ContentGeneration(Base):
         "Message", back_populates="content_generations"
     )
 
-    __table_args__ = ()
+    __table_args__ = (
+        # HIGH IMPACT: Content by user
+        Index("idx_content_generation_user_id", "user_id"),
+        # HIGH IMPACT: Content by conversation
+        Index("idx_content_generation_conversation_id", "conversation_id"),
+        # MEDIUM IMPACT: Content type filtering
+        Index("idx_content_generation_type", "content_type"),
+        # MEDIUM IMPACT: Created at for sorting
+        Index("idx_content_generation_created_at", "created_at"),
+    )
 
     async def to_bm(self) -> wire.ContentGeneration:
         return wire.ContentGeneration(
@@ -574,3 +652,99 @@ Index(
     ContentGeneration.created_at,
 )
 Index("idx_content_generations_type", ContentGeneration.content_type)
+
+
+# Add optimized queries at the end of the file
+class OptimizedQueries:
+    @staticmethod
+    async def get_conversation_with_messages_and_content(
+        session: AsyncSession,
+        conversation_id: str,
+        user_id: str,
+    ) -> Optional[Conversation]:
+        """Single optimized query instead of multiple queries"""
+        query = (
+            select(Conversation)
+            .options(
+                selectinload(Conversation.messages),
+                selectinload(Conversation.content_generations),
+            )
+            .where(
+                and_(
+                    Conversation.id == conversation_id,
+                    Conversation.user_id == user_id,
+                )
+            )
+        )
+        result = await session.execute(query)
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def get_citations_with_chunks_optimized(
+        session: AsyncSession,
+        user_id: str,
+        limit: int = 10,
+    ) -> List[DocumentChunk]:
+        """Optimized query to get random chunks with citations"""
+        query = (
+            select(DocumentChunk)
+            .join(SourceDocument)
+            .options(selectinload(DocumentChunk.source_document))
+            .where(SourceDocument.user_id == user_id)
+            .order_by(func.random())
+            .limit(limit)
+        )
+        result = await session.execute(query)
+        return result.scalars().all()
+
+    @staticmethod
+    async def get_random_chunks_optimized(
+        session: AsyncSession,
+        user_id: str,
+        limit: int = 10,
+    ) -> List[DocumentChunk]:
+        """Get random chunks for content generation"""
+        return await OptimizedQueries._get_random_chunks_optimized(
+            session, user_id, limit
+        )
+
+    @staticmethod
+    async def _get_random_chunks_optimized(
+        session: AsyncSession,
+        user_id: str,
+        limit: int = 10,
+    ) -> List[DocumentChunk]:
+        """Internal method for getting random chunks"""
+        query = (
+            select(DocumentChunk)
+            .join(SourceDocument)
+            .where(SourceDocument.user_id == user_id)
+            .order_by(func.random())
+            .limit(limit)
+        )
+        result = await session.execute(query)
+        return result.scalars().all()
+
+    @staticmethod
+    def count_tokens_optimized(text: str) -> int:
+        """Optimized token counting"""
+        try:
+            encoding = tiktoken.get_encoding("cl100k_base")
+            return len(encoding.encode(text))
+        except:
+            # Fallback to simple word count
+            return len(text.split())
+
+    @staticmethod
+    async def get_content_generation_with_conversation(
+        session: AsyncSession,
+        content_id: str,
+    ) -> Optional[ContentGeneration]:
+        """Get content generation with conversation data"""
+        query = (
+            select(ContentGeneration)
+            .options(selectinload(ContentGeneration.conversation))
+            .where(ContentGeneration.id == content_id)
+        )
+        result = await session.execute(query)
+        return result.scalar_one_or_none()
