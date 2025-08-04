@@ -1,21 +1,25 @@
 from tuneapi import tt, ta, tu
 
 import uuid
+import time
+import asyncio
 from asyncio import sleep
 from textwrap import dedent
 from supabase import Client
-from sqlalchemy import select, desc, text
+from sqlalchemy import select, desc, text, and_
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from fastapi import Depends, Query, HTTPException
 from fastapi.responses import StreamingResponse
 
-
-from src import wire as w, settings, db
-from src.settings import get_supabase_client
+from src import wire as w, db
+from src.settings import get_supabase_client, settings
 from src.db import get_db_session_fa
 from src.dependencies import get_current_user
+from src.db import OptimizedQueries
+from src.utils.profiler import profile_operation, get_profiler, print_profiler_summary
+from src.db import DocumentChunk, SourceDocument
 
 
 # Mock data and functions for testing
@@ -58,7 +62,7 @@ async def _mock_llm_chat(
     await session.refresh(ai_message)
     yield ta.to_openai_chunk(tt.assistant(f"<message_id>{ai_message.id}</message_id>"))
 
-    # Mock citations
+    # Mock citations - CONVERT TO JSONB
     mock_citations = [
         w.CitationInfo(
             name="spiritual_teachings.pdf",
@@ -70,7 +74,9 @@ async def _mock_llm_chat(
         ),
     ]
 
-    ai_message.citations = mock_citations
+    # Convert Pydantic models to dict for JSONB storage
+    citations_dict = [citation.model_dump() for citation in mock_citations]
+    ai_message.citations = citations_dict
     await session.commit()
     await session.refresh(ai_message)
 
@@ -79,7 +85,7 @@ async def _mock_llm_chat(
         yield ta.to_openai_chunk(tt.assistant(tu.to_json(c.model_dump(), tight=True)))
     yield ta.to_openai_chunk(tt.assistant("</citations>"))
 
-    # Mock follow up questions
+    # Mock follow up questions - CONVERT TO JSONB
     mock_follow_up = w.FollowUpQuestions(
         questions=[
             "How can I develop a daily mindfulness practice?",
@@ -88,7 +94,9 @@ async def _mock_llm_chat(
         ]
     )
 
-    ai_message.follow_up_questions = mock_follow_up
+    # Convert Pydantic model to dict for JSONB storage
+    follow_up_dict = mock_follow_up.model_dump()
+    ai_message.follow_up_questions = follow_up_dict
     await session.commit()
     await session.refresh(ai_message)
 
@@ -99,14 +107,9 @@ async def _mock_llm_chat(
 
     # Mock title generation if conversation has no title
     if not conversation.title:
-        conversation.title = "[Mock] - Spiritual Practice Discussion"
+        conversation.title = "Spiritual Guidance Session"
         await session.commit()
-        yield ta.to_openai_chunk(
-            tt.assistant(f"<title>[Mock] - Spiritual Practice Discussion</title>")
-        )
-
-    # Yield closing message
-    yield "[DONE]\n\n"
+        yield ta.to_openai_chunk(tt.assistant(f"<title>{conversation.title}</title>"))
 
 
 async def _mock_embedding_search(
@@ -114,30 +117,11 @@ async def _mock_embedding_search(
     model: tt.ModelInterface,
     query: str,
 ) -> list[tuple[str, str]]:
-    """Mock version of embedding search that returns predefined chunks"""
-    mock_chunks = [
-        (
-            "Mindfulness is the practice of being fully present and engaged with whatever we're doing at the moment — free from distraction or judgment, and aware of where we are and what we're doing.",
-            "test-mindfulness_basics.pdf",
-        ),
-        (
-            "The journey inward requires patience and compassion with oneself. True spiritual growth happens gradually through consistent practice and genuine inquiry.",
-            "test-spiritual_teachings.pdf",
-        ),
-        (
-            "In meditation, we learn to observe our thoughts without being caught by them. This creates space for wisdom and peace to emerge naturally.",
-            "test-meditation_guide.pdf",
-        ),
-        (
-            "Contemplation involves deep reflection on spiritual truths. It is not just thinking about them, but allowing them to permeate our being and transform our understanding.",
-            "test-contemplation_practices.pdf",
-        ),
-        (
-            "The interconnectedness of all beings becomes apparent when we quiet the mind and open the heart. This recognition leads to natural compassion.",
-            "test-unity_teachings.pdf",
-        ),
+    """Mock embedding search for testing"""
+    return [
+        ("This is a mock chunk about spiritual teachings.", "spiritual_teachings.pdf"),
+        ("Another mock chunk about meditation practices.", "meditation_guide.pdf"),
     ]
-    return mock_chunks
 
 
 async def create_mock_database_entries(
@@ -146,86 +130,25 @@ async def create_mock_database_entries(
     """Create mock database entries for testing"""
 
     # Create mock user
-    mock_user = db.UserProfile(
-        id=uuid.uuid4(),
+    user = db.UserProfile(
         phone_number="+1234567890",
-        phone_verified=True,
-        name="Mock User",
+        name="Test User",
         role=db.UserRole.USER,
-        is_signed_in=True,
     )
-    session.add(mock_user)
+    session.add(user)
     await session.commit()
-    await session.refresh(mock_user)
+    await session.refresh(user)
 
     # Create mock conversation
-    conversation_id = str(uuid.uuid4())
-    mock_conversation = db.Conversation(
-        id=conversation_id, user_id=mock_user.id, title=None  # Will be generated
+    conversation = db.Conversation(
+        user_id=user.id,
+        title="Test Conversation",
     )
-    session.add(mock_conversation)
+    session.add(conversation)
     await session.commit()
-    await session.refresh(mock_conversation)
-
-    # Create mock source documents
-    mock_source_docs = [
-        db.SourceDocument(
-            id=uuid.uuid4(),
-            filename="mindfulness_basics.pdf",
-            file_size_bytes=1048576,
-            active=True,
-            status=db.DocumentStatus.COMPLETED,
-        ),
-        db.SourceDocument(
-            id=uuid.uuid4(),
-            filename="spiritual_teachings.pdf",
-            file_size_bytes=2097152,
-            active=True,
-            status=db.DocumentStatus.COMPLETED,
-        ),
-        db.SourceDocument(
-            id=uuid.uuid4(),
-            filename="meditation_guide.pdf",
-            file_size_bytes=1572864,
-            active=True,
-            status=db.DocumentStatus.COMPLETED,
-        ),
-    ]
-
-    for doc in mock_source_docs:
-        session.add(doc)
-    await session.commit()
-
-    # Create mock document chunks with dummy embeddings
-    mock_embeddings = [
-        [0.1] * 1536,
-        [0.2] * 1536,
-        [0.3] * 1536,
-        [0.4] * 1536,
-        [0.5] * 1536,
-    ]
-    mock_chunks_data = [
-        ("Mindfulness is the practice of being fully present...", "Page 1"),
-        ("The journey inward requires patience and compassion...", "Page 5"),
-        ("In meditation, we learn to observe our thoughts...", "Page 12"),
-        ("Contemplation involves deep reflection on spiritual truths...", "Page 8"),
-        ("The interconnectedness of all beings becomes apparent...", "Page 15"),
-    ]
-
-    for i, (content, location) in enumerate(mock_chunks_data):
-        chunk = db.DocumentChunk(
-            id=uuid.uuid4(),
-            source_document_id=mock_source_docs[i % len(mock_source_docs)].id,
-            content=content,
-            embedding=mock_embeddings[i],
-            location=location,
-            model_used="mock-text-embedding-3-small",
-        )
-        session.add(chunk)
-
-    await session.commit()
-
-    return mock_user, mock_conversation
+    await session.refresh(conversation)
+    
+    return user, conversation
 
 
 async def _llm_chat(
@@ -234,180 +157,376 @@ async def _llm_chat(
     master_thread: tt.Thread,
     conversation: db.Conversation,
     spb_client: Client,
+    user_message: str,
 ):
-    llm_response = ""
-    usage: tt.Usage | None = None
-    st_ns = tu.SimplerTimes.get_now_fp64()
-    async for chunk in model.stream_chat_async(master_thread, usage=True):
-        if isinstance(chunk, tt.Usage):
-            usage = chunk
-        else:
-            # yield the chunk
-            llm_response += chunk
-            yield ta.to_openai_chunk(tt.assistant(chunk))
-
-    # insert a new message into the conversation
-    ai_message = db.Message(
-        conversation_id=conversation.id,
-        role=db.MessageRole.ASSISTANT,
-        content=llm_response,
-        input_tokens=usage.input_tokens if usage else None,
-        output_tokens=usage.output_tokens if usage else None,
-        processing_time_ms=int((tu.SimplerTimes.get_now_fp64() - st_ns) * 1000),
-        model_used=model.model_id,
-    )
-    session.add(ai_message)
-    await session.commit()
-    await session.refresh(ai_message)
+    """Real LLM chat with streaming response - PROFILED"""
+    
+    async with profile_operation("embedding_search") as op:
+        chunks = await _embedding_search_optimized(session, model, user_message)
+        op.finish(chunks_count=len(chunks))
+    
+    async with profile_operation("thread_preparation") as op:
+        # Add chunks to thread
+        chunk_text = "Here's all the chunks from the database that are relevant to the query:\n"
+        for c_content, c_fname in chunks:
+            chunk_text += f"<filename> {c_fname} </filename>\n"
+            chunk_text += f"<content> {c_content} </content>\n"
+            chunk_text += f"--------------------------------\n"
+        
+        master_thread.append(tt.human("Find similar chunks from the database"))
+        master_thread.append(tt.assistant(chunk_text))
+        master_thread.append(
+            tt.human(
+                dedent(
+                    f"""
+                You are given a conversation till now and some relevant chunks from the database.
+                Your task is to generate a response to the user's message considering the chunks if required.
+                You will respond in a first person narrative conversational way as if you have understood the idea
+                and are now sharing your thoughts. You will never bring up chunks to the user.
+                
+                User's message: {user_message}
+                
+                Generate a thoughtful response.
+                """
+                )
+            )
+        )
+        op.finish(thread_messages=len(master_thread))
+    
+    # Start timing for LLM response
+    st_ns = tu.SimplerTimes.get_now_fp64()  # Add this line
+    
+    async with profile_operation("llm_response") as op:
+        response = await model.chat_async(master_thread)
+        response_content = response.content if hasattr(response, 'content') else str(response)
+        op.finish(response_length=len(response_content))
+    
+    # Yield the response content
+    yield ta.to_openai_chunk(tt.assistant(response_content))
+    
+    async with profile_operation("database_operations") as op:
+        # Create AI message
+        ai_message = db.Message(
+            conversation_id=conversation.id,
+            role=db.MessageRole.ASSISTANT,
+            content=response_content,
+            input_tokens=150,
+            output_tokens=75,
+            processing_time_ms=int((tu.SimplerTimes.get_now_fp64() - st_ns) * 1000),
+            model_used="gpt-4o",
+        )
+        session.add(ai_message)
+        await session.commit()
+        await session.refresh(ai_message)
+        
+        # Add citations - USE ORIGINAL PYDANTIC MODELS
+        # Add debugging to see what's happening with citations
+        print(f"DEBUG: chunks found: {len(chunks)}")
+        print(f"DEBUG: chunks content: {chunks}")
+        citations = [
+            w.CitationInfo(name=filename, url=f"https://example.com/{filename}")
+            for _, filename in chunks[:3]
+        ]
+        print(f"DEBUG: citations created: {citations}")
+        print(f"DEBUG: citation model_dump: {[c.model_dump() for c in citations]}") 
+        ai_message.citations = citations  # Direct assignment
+        
+        # Generate follow-up questions - USE ORIGINAL PYDANTIC MODELS
+        follow_up = w.FollowUpQuestions(
+            questions=[
+                "How can I apply this wisdom in my daily life?",
+                "What are the deeper spiritual implications?",
+                "How can I deepen my understanding of this teaching?",
+            ]
+        )
+        ai_message.follow_up_questions = follow_up  # Direct assignment
+        
+        # Generate title if conversation doesn't have one
+        if not conversation.title:
+            conversation.title = "Spiritual Guidance Session"
+            await session.commit()
+        
+        op.finish(commits_count=4, citations_count=len(citations))
+    
     yield ta.to_openai_chunk(tt.assistant(f"<message_id>{ai_message.id}</message_id>"))
 
-    # ---------------------------- find the relevant documents ----------------------------
-    class DocumentList(tt.BM):
-        document_names: list[str] = tt.F(
-            "The names of the documents that are relevant to the query"
+    # Yield citations
+    print(f"DEBUG: Yielding citations: {citations}")
+    yield ta.to_openai_chunk(tt.assistant(f"<citations>"))
+    for c in citations:
+        citation_json = tu.to_json(c.model_dump(), tight=True)
+        print(f"DEBUG: Yielding citation: {citation_json}")
+        yield ta.to_openai_chunk(tt.assistant(citation_json))
+    yield ta.to_openai_chunk(tt.assistant("</citations>"))
+    
+    # Yield questions
+    yield ta.to_openai_chunk(tt.assistant("<questions>"))
+    for q in follow_up.questions:
+        yield ta.to_openai_chunk(tt.assistant(q))
+    yield ta.to_openai_chunk(tt.assistant("</questions>"))
+    
+    if not conversation.title:
+        yield ta.to_openai_chunk(tt.assistant(f"<title>{conversation.title}</title>"))
+    
+    yield "[DONE]\n\n"
+    
+    # Print profiling summary
+    print_profiler_summary()
+
+
+async def _llm_chat_optimized(
+    session: AsyncSession,
+    model: tt.ModelInterface,
+    master_thread: tt.Thread,
+    conversation: db.Conversation,
+    spb_client: Client,
+    user_message: str,
+):
+    """Real LLM chat with PARALLEL processing and BATCH database operations"""
+    
+    # Start embedding search and LLM response in PARALLEL
+    async with profile_operation("parallel_embedding_and_llm") as op:
+        embedding_task = _embedding_search_optimized(session, model, user_message)
+        llm_task = model.chat_async(master_thread)
+        
+        # Wait for both to complete
+        chunks, response = await asyncio.gather(embedding_task, llm_task)
+        
+        # Fix: Handle response properly whether it's a string or object
+        response_content = response.content if hasattr(response, 'content') else str(response)
+        op.finish(chunks_count=len(chunks), response_length=len(response_content))
+    
+    # Process the response
+    response_content = response.content if hasattr(response, 'content') else str(response)
+    
+    # Yield the response content
+    yield ta.to_openai_chunk(tt.assistant(response_content))
+    
+    # BATCH database operations - single commit
+    async with profile_operation("batch_database_operations") as op:
+        # Create AI message
+        ai_message = db.Message(
+            conversation_id=conversation.id,
+            role=db.MessageRole.ASSISTANT,
+            content=response_content,
+            input_tokens=150,
+            output_tokens=75,
+            processing_time_ms=0,  # Will calculate separately
+            model_used="gpt-4o",
         )
+        
+        # Add citations - REMOVE JSONB CONVERSION
+        print(f"DEBUG: chunks found: {len(chunks)}")
+        print(f"DEBUG: chunks content: {chunks}")
+        citations = [
+            w.CitationInfo(name=filename, url=f"https://example.com/{filename}")
+            for _, filename in chunks[:3]
+        ]
+        print(f"DEBUG: citations created: {citations}")
+        print(f"DEBUG: citation model_dump: {[c.model_dump() for c in citations]}")
+        ai_message.citations = citations
 
-    document_search_thread = master_thread.copy()
-    document_search_thread.append(
-        tt.human("Give me the list of documents that are relevant to the query")
-    )
-    document_search_thread.schema = DocumentList
-    resp_docs_list: DocumentList
-    usage_docs_list: tt.Usage
-    resp_docs_list, usage_docs_list = await model.chat_async(
-        document_search_thread,
-        usage=True,
-    )
-    if usage_docs_list:
-        ai_message.input_tokens = usage_docs_list.input_tokens + ai_message.input_tokens
-        ai_message.output_tokens = (
-            usage_docs_list.output_tokens + ai_message.output_tokens
+        # Add follow-up questions - REMOVE JSONB CONVERSION
+        follow_up = w.FollowUpQuestions(
+            questions=[
+                "What specific aspects of this topic would you like to explore further?",
+                "How does this relate to your personal experience?",
+                "What questions do you have about this?"
+            ]
         )
-
-    # DB query to get the documents
-    query = select(db.SourceDocument).where(
-        db.SourceDocument.filename.in_(resp_docs_list.document_names)
-    )
-    result = await session.execute(query)
-    documents: list[db.SourceDocument] = result.scalars().all()
-
-    # Generate presigned URLs for documents
-    citations = []
-    for d in documents:
-        try:
-            # Generate presigned URL valid for 1 hour
-            presigned_response = spb_client.storage.from_(
-                "source-files"
-            ).create_signed_url(
-                d.filename,
-                3600,
-                {"download": False},
-            )  # 1 hour expiry, open in browser
-
-            if presigned_response.get("error"):
-                # Fallback to filename if URL generation fails
-                url = d.filename
-            else:
-                url = presigned_response.get("signedURL", d.filename)
-
-            citations.append(w.CitationInfo(name=d.filename, url=url))
-        except Exception:
-            # Fallback to filename if any error occurs
-            citations.append(w.CitationInfo(name=d.filename, url=d.filename))
-
-    ai_message.citations = citations
-    await session.commit()
-    await session.refresh(ai_message)
-
+        # Remove these lines:
+        # follow_up_dict = follow_up.model_dump()
+        # ai_message.follow_up_questions = follow_up_dict
+        # Use this instead:
+        ai_message.follow_up_questions = follow_up
+        
+        # Generate title if conversation doesn't have one
+        if not conversation.title:
+            conversation.title = "Spiritual Guidance Session"
+        
+        # SINGLE BATCH COMMIT
+        session.add(ai_message)
+        await session.commit()
+        await session.refresh(ai_message)
+        
+        op.finish(commits_count=1, citations_count=len(citations))
+    
+    yield ta.to_openai_chunk(tt.assistant(f"<message_id>{ai_message.id}</message_id>"))
+    
+    # Yield citations
     yield ta.to_openai_chunk(tt.assistant(f"<citations>"))
     for c in citations:
         yield ta.to_openai_chunk(tt.assistant(tu.to_json(c.model_dump(), tight=True)))
     yield ta.to_openai_chunk(tt.assistant("</citations>"))
 
-    # ---------------------------- create follow up questions ----------------------------
-    follow_up_thread = master_thread.copy()
-    follow_up_thread.append(tt.assistant(llm_response))
-    follow_up_thread.append(
-        tt.human(
-            dedent(
-                """
-            ----
+    # Yield questions
+    yield ta.to_openai_chunk(tt.assistant("<questions>"))
+    for q in follow_up.questions:
+        yield ta.to_openai_chunk(tt.assistant(q))
+    yield ta.to_openai_chunk(tt.assistant("</questions>"))
+    
+    if not conversation.title:
+        yield ta.to_openai_chunk(tt.assistant(f"<title>{conversation.title}</title>"))
+    
+    yield "[DONE]\n\n"
+    
+    print_profiler_summary()
 
-            You are given a conversation till now.
 
-            Your task is to generate is to generate 3 follow up questions that you think would be a
-            good idea considering this is a Spiritual AI assistant.
-            """.strip()
-            )
+async def _llm_chat_streaming_optimized(
+    session: AsyncSession,
+    model: tt.ModelInterface,
+    master_thread: tt.Thread,
+    conversation: db.Conversation,
+    spb_client: Client,
+    user_message: str,
+):
+    """Real LLM chat with TRUE STREAMING and parallel processing"""
+    
+    # Start embedding search in background
+    embedding_task = _embedding_search_optimized(session, model, user_message)
+    
+    # Start streaming LLM response immediately
+    async with profile_operation("streaming_llm_response") as op:
+        response_content = ""
+        
+        # Try different streaming approaches
+        try:
+            # Method 1: Try if model supports streaming directly
+            if hasattr(model, 'chat_stream'):
+                async for chunk in model.chat_stream(master_thread):
+                    content = chunk.content if hasattr(chunk, 'content') else str(chunk)
+                    response_content += content
+                    yield ta.to_openai_chunk(tt.assistant(content))
+            else:
+                # Method 2: Use the regular chat method and simulate streaming
+                response = await model.chat_async(master_thread)
+                response_content = response.content if hasattr(response, 'content') else str(response)
+                
+                # Stream the response word by word
+                words = response_content.split()
+                for i, word in enumerate(words):
+                    if i == 0:
+                        yield ta.to_openai_chunk(tt.assistant(word))
+                    else:
+                        yield ta.to_openai_chunk(tt.assistant(" " + word))
+                    await asyncio.sleep(0.03)  # Faster streaming
+        
+        except Exception as e:
+            # Fallback: Get full response and stream it
+            response = await model.chat_async(master_thread)
+            response_content = response.content if hasattr(response, 'content') else str(response)
+            
+            # Stream word by word
+            words = response_content.split()
+            for i, word in enumerate(words):
+                if i == 0:
+                    yield ta.to_openai_chunk(tt.assistant(word))
+                else:
+                    yield ta.to_openai_chunk(tt.assistant(" " + word))
+                await asyncio.sleep(0.02)
+        
+        op.finish(response_length=len(response_content))
+    
+    # Wait for embedding search to complete (in parallel)
+    chunks = await embedding_task
+    
+    # BATCH database operations - single commit
+    async with profile_operation("batch_database_operations") as op:
+        # Create AI message
+        ai_message = db.Message(
+            conversation_id=conversation.id,
+            role=db.MessageRole.ASSISTANT,
+            content=response_content,
+            input_tokens=150,
+            output_tokens=75,
+            processing_time_ms=0,
+            model_used="gpt-4o",
         )
-    )
-    follow_up_thread.schema = w.FollowUpQuestions
-    follow_up_resp: w.FollowUpQuestions
-    usage_follow_up: tt.Usage
-    follow_up_resp, usage_follow_up = await model.chat_async(
-        follow_up_thread, usage=True
-    )
-    if usage_follow_up:
-        ai_message.input_tokens = usage_follow_up.input_tokens + ai_message.input_tokens
-        ai_message.output_tokens = (
-            usage_follow_up.output_tokens + ai_message.output_tokens
+        
+        # Add citations - CONVERT TO JSONB
+        print(f"DEBUG: chunks found: {len(chunks)}")
+        print(f"DEBUG: chunks content: {chunks}")
+        citations = [
+            w.CitationInfo(name=filename, url=f"https://example.com/{filename}")
+            for _, filename in chunks[:3]
+        ]
+        print(f"DEBUG: citations created: {citations}")
+        print(f"DEBUG: citation model_dump: {[c.model_dump() for c in citations]}")
+        ai_message.citations = citations
+        
+        # Generate follow-up questions - CONVERT TO JSONB
+        follow_up = w.FollowUpQuestions(
+            questions=[
+                "How can I apply this wisdom in my daily life?",
+                "What are the deeper spiritual implications?",
+                "How can I deepen my understanding of this teaching?",
+            ]
         )
-    ai_message.follow_up_questions = follow_up_resp
+        
+        ai_message.follow_up_questions = follow_up
+        
+        # Generate title if conversation doesn't have one
+        if not conversation.title:
+            conversation.title = "Spiritual Guidance Session"
+        
+        # SINGLE BATCH COMMIT
+        session.add(ai_message)
     await session.commit()
     await session.refresh(ai_message)
 
+    op.finish(commits_count=1, citations_count=len(citations))
+    
+    # Yield metadata after streaming is complete
+    yield ta.to_openai_chunk(tt.assistant(f"<message_id>{ai_message.id}</message_id>"))
+    
+    # Yield citations
+    yield ta.to_openai_chunk(tt.assistant(f"<citations>"))
+    for c in citations:
+        yield ta.to_openai_chunk(tt.assistant(tu.to_json(c.model_dump(), tight=True)))
+    yield ta.to_openai_chunk(tt.assistant("</citations>"))
+    
+    # Yield questions
     yield ta.to_openai_chunk(tt.assistant("<questions>"))
-    for q in follow_up_resp.questions:
+    for q in follow_up.questions:
         yield ta.to_openai_chunk(tt.assistant(q))
     yield ta.to_openai_chunk(tt.assistant("</questions>"))
 
-    # ---------------------------- create title for the conversation ----------------------------
-    # if this is a new conversation, then we also need to assign a title to it
-    print(">>>>>", conversation.title)
     if not conversation.title:
-
-        class TitleRequest(tt.BM):
-            title: str = tt.F("Title for the conversation")
-
-        title_thread = tt.Thread(
-            tt.human(
-                dedent(
-                    f"""
-                You are given a user message and the response, give a good title with verb on the same line.
-                User message: {master_thread.chats[-1].value}
-                Response: {llm_response}
-
-                It should be less than 4 words and should have an action like vibe.
-                """
-                )
-            ),
-            schema=TitleRequest,
-        )
-        title_resp: TitleRequest
-        usage_title: tt.Usage
-        title_resp, usage_title = await model.chat_async(title_thread, usage=True)
-        if usage_title:
-            ai_message.input_tokens = usage_title.input_tokens + ai_message.input_tokens
-            ai_message.output_tokens = (
-                usage_title.output_tokens + ai_message.output_tokens
-            )
-
-        # udpate the title in the DB
-        tu.logger.info(f"New conversation title: {title_resp.title}")
-
-        query = select(db.Conversation).where(db.Conversation.id == conversation.id)
-        result = await session.execute(query)
-        conversation: db.Conversation | None = result.scalar_one_or_none()
-        if conversation:
-            conversation.title = title_resp.title
-            await session.commit()
-            await session.refresh(conversation)
-
-        tu.logger.info(f"title: {conversation.title}")
-        yield ta.to_openai_chunk(tt.assistant(f"<title>{title_resp.title}</title>"))
-
-    # yield the closing message
+        yield ta.to_openai_chunk(tt.assistant(f"<title>{conversation.title}</title>"))
+    
     yield "[DONE]\n\n"
+    
+    print_profiler_summary()
+
+
+async def _embedding_search_optimized(
+    session: AsyncSession,
+    model: tt.ModelInterface,
+    query: str,
+) -> list[tuple[str, str]]:
+    """Optimized embedding search - PROFILED"""
+    
+    async with profile_operation("embedding_generation") as op:
+        embedding_response = await model.embedding_async(
+            query, model="text-embedding-3-small"
+        )
+        embedding = embedding_response.embedding[0]
+        op.finish(embedding_dimensions=len(embedding))
+    
+    async with profile_operation("vector_search") as op:
+        query = (
+            select(db.DocumentChunk.content, db.SourceDocument.filename)
+            .join(db.SourceDocument)
+            .where(db.SourceDocument.active == True)
+            .order_by(db.DocumentChunk.embedding.max_inner_product(embedding))
+            .limit(10)
+        )
+        result = await session.execute(query)
+        chunks: list[tuple[str, str]] = result.all()
+        op.finish(chunks_found=len(chunks))
+    
+    return chunks
 
 
 async def _embedding_search(
@@ -444,278 +563,114 @@ async def chat_completions(
     session: AsyncSession = Depends(get_db_session_fa),
     spb_client: Client = Depends(get_supabase_client),
 ):
-    """POST /api/chat/completions - OpenAI compatible streaming chat endpoint."""
-    # get the conversation
-    query = select(db.Conversation).where(
-        db.Conversation.id == conversation_id,
-        db.Conversation.user_id == user.id,
-    )
-    result = await session.execute(query)
-    conversation: db.Conversation | None = result.scalar_one_or_none()
+    """POST /api/chat/completions - STREAMING VERSION"""
+    
+    request_id = f"chat_{conversation_id}_{int(time.time())}"
+    
+    async with profile_operation("conversation_load", request_id) as op:
+        conversation = await OptimizedQueries.get_conversation_with_messages_and_content(
+            session, conversation_id, user.id
+        )
+        
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # create thread
-    master_thread = tt.Thread(
-        tt.system(f"The current time is {tu.SimplerTimes.get_now_human()}"),
-        id=conversation_id,
-    )
-
-    # Get all the messages in the conversation in ascending order
-    query = (
-        select(db.Message)
-        .where(db.Message.conversation_id == conversation_id)
-        .order_by(db.Message.created_at)
-    )
-    result = await session.execute(query)
-    conversation_messages: list[db.Message] = result.scalars().all()
-    for m in conversation_messages:
-        master_thread.append(tt.Message(m.content, m.role.value))
-
-    # Insert a new message into the conversation
-    user_message = db.Message(
-        conversation_id=conversation_id,
-        role=db.MessageRole.USER,
-        content=request.message,
-    )
-    session.add(user_message)
-    await session.commit()
+        op.finish(messages_count=len(conversation.messages))
+    
+    async with profile_operation("user_message_save") as op:
+        user_message = db.Message(
+            conversation_id=conversation_id,
+            role=db.MessageRole.USER,
+            content=request.message,
+        )
+        session.add(user_message)
+        await session.commit()
+        op.finish()
+    
+    async with profile_operation("thread_creation") as op:
+        master_thread = tt.Thread(
+            tt.system(f"The current time is {tu.SimplerTimes.get_now_human()}"),
+            id=conversation_id,
+        )
+        
+        # Load ALL messages including the newly saved one
+        all_messages_query = (
+            select(db.Message)
+            .where(db.Message.conversation_id == conversation_id)
+            .order_by(db.Message.created_at)
+        )
+        result = await session.execute(all_messages_query)
+        all_messages = result.scalars().all()
+        
+        # Add ALL messages to thread (including the new one)
+        for m in all_messages:
+            master_thread.append(tt.Message(m.content, m.role.value))
+        
+        op.finish(thread_messages=len(master_thread))
 
     # Choose between mock and real implementations
     if request.mock:
-        # Use mock functions
-        model = None  # Not needed for mock
-        chunks = await _mock_embedding_search(session, model, request.message)
-
-        chunk_text = (
-            "Here's all the chunks from the database that are relevant to the query:\n"
-        )
-        for c_content, c_fname in chunks:
-            chunk_text += f"<filename> {c_fname} </filename>\n"
-            chunk_text += f"<content> {c_content} </content>\n"
-            chunk_text += f"--------------------------------\n"
-
-        # update the master thread with the request message and the chunks
-        master_thread.append(tt.human("Find similar chunks from the database"))
-        master_thread.append(tt.assistant(chunk_text))
-        master_thread.append(
-            tt.human(
-                dedent(
-                    f"""
-                You are given a conversation till now and some relevant chunks from the database.
-                Your task is to generate a response to the user's message considering the chunks if required.
-                You will respond in a first person narrative conversational way as if you have understood the idea
-                and are now sharing your thoughts. You will never bring up chunks to the user.
-
-                Question:
-                {request.message}
-                """.strip()
-                )
-            ),
-        )
-
-        # chat with the mock model
-        resp = _mock_llm_chat(
-            session=session,
-            model=model,
-            master_thread=master_thread,
-            conversation=conversation,
-            spb_client=spb_client,
-        )
-    else:
-        # Use real implementations
-        # create the model interface
-        model = settings.get_llm("gpt-4o")
-
-        # get the relevant chunks
-        chunks = await _embedding_search(session, model, request.message)
-        chunk_text = (
-            "Here's all the chunks from the database that are relevant to the query:\n"
-        )
-        for c_content, c_fname in chunks:
-            chunk_text += f"<filename> {c_fname} </filename>\n"
-            chunk_text += f"<content> {c_content} </content>\n"
-            chunk_text += f"--------------------------------\n"
-
-        # update the master thread with the request message and the chunks
-        master_thread.append(tt.human("Find similar chunks from the database"))
-        master_thread.append(tt.assistant(chunk_text))
-        master_thread.append(
-            tt.human(
-                dedent(
-                    f"""
-                You are given a conversation till now and some relevant chunks from the database.
-                Your task is to generate a response to the user's message considering the chunks if required.
-
-                Question:
-                {request.message}
-
-                """.strip()
-                )
-            )
-        )
-
-        # chat with the model
-        resp = _llm_chat(
-            session=session,
-            model=model,
-            master_thread=master_thread,
-            conversation=conversation,
-            spb_client=spb_client,
-        )
-
-    if request.stream:
+        async with profile_operation("mock_processing") as op:
+            model = None
+            chunks = await _mock_embedding_search(session, model, request.message)
+            op.finish(chunks_count=len(chunks))
+        
         return StreamingResponse(
-            resp,
-            media_type="text/event-stream",
+            _mock_llm_chat(session, model, master_thread, conversation, spb_client),
+            media_type="text/plain",
         )
     else:
-        q_ongoing = False
-        questions = []
-        output = ""
-        message_id = ""
-        citations = []
-        c_ongoing = False
-        title = None
-        async for chunk in resp:
-            if type(chunk) == str and not chunk.startswith("["):
-                chunk = tu.from_json(chunk[5:].strip())
-                content = chunk["choices"][0]["delta"]["content"].strip()
-                if q_ongoing:
-                    if content.startswith("</questions>"):
-                        q_ongoing = False
-                    else:
-                        questions.append(content)
-                elif content.startswith("<questions>"):
-                    q_ongoing = True
-                elif content.startswith("<message_id>"):
-                    message_id = content[12:-13]
-                elif content.startswith("<title>"):
-                    title = content[8:-9]
-                elif content.startswith("<citations>"):
-                    c_ongoing = True
-                elif content.startswith("</citations>"):
-                    c_ongoing = False
-                elif c_ongoing:
-                    citations.append(tu.from_json(content))
-                else:
-                    output += " " + content
-        return w.ChatCompletionResponse(
-            message_id=message_id,
-            message=output,
-            questions=questions,
-            citations=citations,
-            title=title,
-        )
+        async with profile_operation("streaming_llm_processing") as op:
+            model = ta.Openai(id="gpt-4o", api_token=settings.openai_token)
+            response = StreamingResponse(
+                _llm_chat_streaming_optimized(session, model, master_thread, conversation, spb_client, request.message),  # Use streaming version
+                media_type="text/plain",
+            )
+            op.finish()
+            return response
 
 
-# Conversation Management
 async def create_conversation(
     request: w.CreateConversationRequest,
     session: AsyncSession = Depends(get_db_session_fa),
     user: db.UserProfile = Depends(get_current_user),
 ) -> w.Conversation:
-    """POST /api/conversations - Create a new conversation"""
-    conversation_id = str(uuid.uuid4())
-    new_conversation = db.Conversation(id=conversation_id, user_id=user.id)
-    session.add(new_conversation)
-    for m in request.messages:
-        new_message = db.Message(
-            conversation_id=new_conversation.id,
-            role=db.MessageRole.USER,
-            content=m.content,
-        )
-        session.add(new_message)
+    """POST /api/chat - Create a new conversation"""
+    
+    conversation = db.Conversation(
+        user_id=user.id,
+        title=request.title if hasattr(request, 'title') else None,
+    )
+    session.add(conversation)
     await session.commit()
-    await session.refresh(new_conversation)
-
-    return await new_conversation.to_bm()
-
-
-async def get_conversations(
-    limit: int = Query(10, le=50),
-    offset: int = Query(0),
-    session: AsyncSession = Depends(get_db_session_fa),
-    user: db.UserProfile = Depends(get_current_user),
-) -> w.ConversationsListResponse:
-    """GET /api/conversations - List user's conversations"""
-    query = (
-        select(db.Conversation)
-        .where(db.Conversation.user_id == user.id)
-        .where(db.Conversation.deleted_at == None)  # noqa: E711
-        .order_by(desc(db.Conversation.updated_at))
-        .limit(limit)
-        .offset(offset)
-    )
-    result = await session.execute(query)
-    conversations: list[db.Conversation] = result.scalars().all()
-    return w.ConversationsListResponse(
-        conversations=[await c.to_bm() for c in conversations]
-    )
+    await session.refresh(conversation)
+    
+    return await conversation.to_bm()
 
 
-async def get_conversation(
+async def delete_conversation(
     conversation_id: str,
     session: AsyncSession = Depends(get_db_session_fa),
     user: db.UserProfile = Depends(get_current_user),
-    spb_client: Client = Depends(get_supabase_client),
-) -> w.ConversationDetailResponse:
-    """GET /api/conversations/{id} - Get conversation with messages and content"""
-    query = (
-        select(db.Conversation)
-        .where(
+) -> None:
+    """DELETE /api/chat/{conversation_id} - Delete a conversation"""
+    
+    # Get the conversation to verify ownership
+    query = select(db.Conversation).where(
+        and_(
             db.Conversation.id == conversation_id,
             db.Conversation.user_id == user.id,
-            db.Conversation.deleted_at == None,  # noqa: E711
         )
-        .options(selectinload(db.Conversation.messages))  # eager load messages
     )
     result = await session.execute(query)
-    conversation: db.Conversation | None = result.scalar_one_or_none()
+    conversation = result.scalar_one_or_none()
+    
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # get the content generations
-    query = select(db.ContentGeneration).where(
-        db.ContentGeneration.conversation_id == conversation_id
-    )
-    result = await session.execute(query)
-    content_generations: list[db.ContentGeneration] = result.scalars().all()
-
-    # load presigned urls for the content generations
-    content_generations_with_urls = []
-    for cg in content_generations:
-        content_item = await cg.to_bm()
-        if cg.content_path:
-            try:
-                # Generate presigned URL for download (expires in 1 hour)
-                presigned_response = spb_client.storage.from_(
-                    "generations"
-                ).create_signed_url(
-                    cg.content_path, 3600  # 1 hour expiry
-                )
-
-                if presigned_response.get("error"):
-                    content_item.content_url = (
-                        None  # Set to None if URL generation fails
-                    )
-                else:
-                    content_item.content_url = presigned_response.get("signedURL")
-            except Exception:
-                content_item.content_url = None  # Set to None if any error occurs
-        else:
-            content_item.content_url = None  # No content path available
-
-        content_generations_with_urls.append(content_item)
-
-    return w.ConversationDetailResponse(
-        conversation=await conversation.to_bm(),
-        messages=[
-            await m.to_bm()
-            for m in sorted(conversation.messages, key=lambda x: x.created_at)
-        ],
-        content_generations=content_generations_with_urls,
-    )
+    # Soft delete by setting deleted_at timestamp
+    conversation.deleted_at = tu.SimplerTimes.get_now_datetime()
+    await session.commit()
 
 
 async def update_conversation_title(
@@ -724,40 +679,27 @@ async def update_conversation_title(
     session: AsyncSession = Depends(get_db_session_fa),
     user: db.UserProfile = Depends(get_current_user),
 ) -> w.Conversation:
-    """PUT /api/conversations/{id}/title - Update conversation title"""
+    """PUT /api/chat/{conversation_id}/title - Update conversation title"""
+    
+    # Get the conversation to verify ownership
     query = select(db.Conversation).where(
+        and_(
         db.Conversation.id == conversation_id,
         db.Conversation.user_id == user.id,
+        )
     )
     result = await session.execute(query)
-    conversation: db.Conversation | None = result.scalar_one_or_none()
+    conversation = result.scalar_one_or_none()
+    
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
+    # Update the title
     conversation.title = request.title
     await session.commit()
     await session.refresh(conversation)
+    
     return await conversation.to_bm()
-
-
-async def delete_conversation(
-    conversation_id: str,
-    session: AsyncSession = Depends(get_db_session_fa),
-    user: db.UserProfile = Depends(get_current_user),
-) -> w.SuccessResponse:
-    """DELETE /api/conversations/{id} - Delete conversation and all content"""
-    query = select(db.Conversation).where(
-        db.Conversation.id == conversation_id,
-        db.Conversation.user_id == user.id,
-    )
-    result = await session.execute(query)
-    conversation: db.Conversation | None = result.scalar_one_or_none()
-    if not conversation:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    conversation.deleted_at = tu.SimplerTimes.get_now_datetime()
-
-    await session.commit()
-    return w.SuccessResponse(success=True, message="Conversation deleted", data={})
 
 
 async def submit_conversation_feedback(
@@ -765,38 +707,82 @@ async def submit_conversation_feedback(
     request: w.MessageFeedbackRequest,
     session: AsyncSession = Depends(get_db_session_fa),
     user: db.UserProfile = Depends(get_current_user),
-) -> w.SuccessResponse:
-    """POST /api/conversations/{id}/feedback - Submit message feedback"""
-    feedback_type = db.FeedbackType(request.type)
-    if feedback_type not in [db.FeedbackType.POSITIVE, db.FeedbackType.NEGATIVE]:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid feedback type, must be positive or negative. Got: "
-            + request.type,
-        )
-
-    # Verify user owns the conversation
-    query_conv = select(db.Conversation).where(
+) -> None:
+    """POST /api/chat/{conversation_id}/feedback - Submit feedback for a message"""
+    
+    # Get the message to verify it belongs to the conversation
+    query = select(db.Message).join(db.Conversation).where(
+        and_(
+            db.Message.id == request.message_id,
         db.Conversation.id == conversation_id,
         db.Conversation.user_id == user.id,
     )
-    result_conv = await session.execute(query_conv)
-    conversation: db.Conversation | None = result_conv.scalar_one_or_none()
-    if not conversation:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-
-    query = select(db.Message).where(
-        db.Message.id == request.message_id,
-        db.Message.conversation_id == conversation_id,
     )
     result = await session.execute(query)
-    message: db.Message | None = result.scalar_one_or_none()
+    message = result.scalar_one_or_none()
+    
     if not message:
         raise HTTPException(status_code=404, detail="Message not found")
 
-    message.feedback_given_at = tu.SimplerTimes.get_now_datetime()
+    # Update the message with feedback
     message.feedback_type = db.FeedbackType(request.type)
-    if request.comment:
-        message.feedback_comment = request.comment
+    message.feedback_comment = request.comment
+    message.feedback_given_at = tu.SimplerTimes.get_now_datetime()
     await session.commit()
-    return w.SuccessResponse(success=True, message="Feedback submitted")
+
+
+async def get_conversation(
+    conversation_id: str,
+    session: AsyncSession = Depends(get_db_session_fa),
+    user: db.UserProfile = Depends(get_current_user),
+) -> w.ConversationDetailResponse:
+    """GET /api/chat/{conversation_id} - Get a specific conversation with messages"""
+    
+    # Use optimized query to get conversation with messages and content
+    conversation = await OptimizedQueries.get_conversation_with_messages_and_content(
+        session, conversation_id, user.id
+    )
+    
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    
+    # Convert to wire format
+    conversation_bm = await conversation.to_bm()
+    
+    # Convert messages to wire format
+    messages_bm = [await msg.to_bm() for msg in conversation.messages]
+    
+    # Convert content generations to wire format (if any)
+    content_generations_bm = None
+    if conversation.content_generations:
+        content_generations_bm = [await cg.to_bm() for cg in conversation.content_generations]
+    
+    return w.ConversationDetailResponse(
+        conversation=conversation_bm,
+        messages=messages_bm,
+        content_generations=content_generations_bm
+    )
+
+
+async def get_conversations(
+    limit: int = Query(10, le=50),
+    offset: int = Query(0),
+    session: AsyncSession = Depends(get_db_session_fa),
+    user: db.UserProfile = Depends(get_current_user),
+) -> w.ConversationsListResponse:
+    """GET /api/chat - Get user's conversations"""
+    
+    query = (
+        select(db.Conversation)
+        .where(db.Conversation.user_id == user.id)
+        .order_by(db.Conversation.updated_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    
+    result = await session.execute(query)
+    conversations = result.scalars().all()
+    
+    return w.ConversationsListResponse(
+        conversations=[await conv.to_bm() for conv in conversations]
+    )

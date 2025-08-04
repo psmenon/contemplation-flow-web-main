@@ -1,13 +1,14 @@
 import tempfile
 import os
 import subprocess
+import time
 from textwrap import dedent
 import tiktoken
+from tuneapi import tt, tu
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from supabase import Client
-from tuneapi import tu
 
 from src.db import (
     ContentGeneration,
@@ -19,6 +20,10 @@ from src.db import (
 )
 from src.settings import get_llm, get_supabase_client
 from src.db import get_db_session
+# Import the optimized queries
+from src.db import OptimizedQueries
+
+from src.utils.profiler import profile_operation, get_profiler, print_profiler_summary
 
 
 async def generate_audio_content(
@@ -75,108 +80,97 @@ async def generate_audio_sync(
     spb_client: Client,
     content_id: str,
 ) -> tuple[str, str]:
-    """Generate audio content synchronously and return content_path and transcript"""
-
-    # Get the conversation to get the user_id
-    query = select(Conversation).where(Conversation.id == conversation_id)
-    result = await session.execute(query)
-    conversation = result.scalar_one_or_none()
-    if not conversation:
-        raise ValueError(f"Conversation with id {conversation_id} not found")
-
-    tu.logger.info(f"Generating audio for conversation {conversation_id}/{message_id}")
-
-    # Get source content and generate transcript
-    source_content = await collect_source_content(session, conversation_id)
-    transcript = await generate_meditation_transcript(source_content)
-
-    # Generate audio using text_to_speech_async
-    model = get_llm("gpt-4o")
-    audio_bytes = await model.text_to_speech_async(
-        prompt=transcript,
-        voice="shimmer",
-        model="gpt-4o-mini-tts",
-        instructions="""
-        For sound effects transcript has tags like [breathing], [pause], [silence], etc.
-        - For pauses use [pause] tag.
-        - For breathing use [breathing] tag.
-        - When has [silence], add 1 second of silence.
-        - When has [silence-n], add n seconds of silence.
-        """,
-    )
-    tu.logger.info(f"Generated audio of {len(audio_bytes)} bytes")
-
-    # Compress audio to mp3 using ffmpeg
-    compressed_audio_bytes = await compress_audio_to_mp3(audio_bytes)
-    tu.logger.info(f"Compressed audio to {len(compressed_audio_bytes)} bytes")
-
-    # Upload to Supabase
-    content_path = f"meditation-audio/{content_id}.mp3"
-
-    tu.logger.info(f"Uploading audio to supabase: {content_path}")
-    spb_client.storage.from_("generations").upload(
-        content_path,
-        compressed_audio_bytes,
-        {"content-type": "audio/mpeg"},
-    )
-
-    tu.logger.info(f"Successfully created audio content generation: {content_id}")
+    """Generate audio content synchronously - PROFILED"""
+    
+    request_id = f"audio_{content_id}_{int(time.time())}"
+    
+    async with profile_operation("conversation_load", request_id) as op:
+        query = select(Conversation).where(Conversation.id == conversation_id)
+        result = await session.execute(query)
+        conversation = result.scalar_one_or_none()
+        if not conversation:
+            raise ValueError(f"Conversation with id {conversation_id} not found")
+        op.finish()
+    
+    async with profile_operation("source_content_collection") as op:
+        source_content = await collect_source_content_optimized(session, conversation_id)
+        op.finish(content_length=len(source_content))
+    
+    async with profile_operation("transcript_generation") as op:
+        transcript = await generate_meditation_transcript(source_content)
+        op.finish(transcript_length=len(transcript))
+    
+    async with profile_operation("audio_generation") as op:
+        model = get_llm("gpt-4o")
+        audio_bytes = await model.text_to_speech_async(
+            prompt=transcript,
+            voice="shimmer",
+            model="gpt-4o-mini-tts",
+            instructions="""
+            For sound effects transcript has tags like [breathing], [pause], [silence], etc.
+            Please follow these instructions:
+            - Speak in a calm, soothing voice
+            - Pause appropriately for breathing instructions
+            - Use natural pacing for meditation
+            - Maintain consistent volume and tone
+            """,
+        )
+        op.finish(audio_size_bytes=len(audio_bytes))
+    
+    async with profile_operation("audio_compression") as op:
+        compressed_audio = await compress_audio_to_mp3(audio_bytes)
+        op.finish(compressed_size_bytes=len(compressed_audio))
+    
+    async with profile_operation("supabase_upload") as op:
+        content_path = f"meditation-audio/{content_id}.mp3"
+        spb_client.storage.from_("generations").upload(
+            content_path,
+            compressed_audio,
+            {"content-type": "audio/mpeg"},
+        )
+        op.finish(upload_path=content_path)
+    
+    print_profiler_summary()
     return content_path, transcript
 
 
-async def compress_audio_to_mp3(audio_bytes: bytes) -> bytes:
-    """Compress audio bytes to MP3 format using ffmpeg"""
-
-    # Create temporary files for input and output
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as input_file:
-        input_file.write(audio_bytes)
-        input_path = input_file.name
-
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as output_file:
-        output_path = output_file.name
-
-    try:
-        # Use ffmpeg to convert to MP3 with good quality settings
-        cmd = [
-            "ffmpeg",
-            "-i",
-            input_path,  # Input file
-            "-codec:a",
-            "libmp3lame",  # MP3 encoder
-            "-b:a",
-            "128k",  # Audio bitrate (128 kbps for good quality/size balance)
-            "-ar",
-            "44100",  # Sample rate
-            "-ac",
-            "2",  # Stereo channels
-            "-y",  # Overwrite output file
-            output_path,
-        ]
-
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        tu.logger.info(f"Successfully compressed audio using ffmpeg")
-
-        # Read the compressed audio
-        with open(output_path, "rb") as f:
-            compressed_bytes = f.read()
-
-        return compressed_bytes
-
-    except subprocess.CalledProcessError as e:
-        tu.logger.error(f"FFmpeg compression failed: {e}")
-        tu.logger.error(f"FFmpeg stderr: {e.stderr}")
-        # If compression fails, return original audio bytes
-        tu.logger.warning("Falling back to original audio without compression")
-        return audio_bytes
-
-    finally:
-        # Clean up temporary files
-        for temp_path in [input_path, output_path]:
-            try:
-                if os.path.exists(temp_path):
-                    os.unlink(temp_path)
-            except Exception as e:
-                tu.logger.warning(f"Failed to cleanup temporary file {temp_path}: {e}")
+async def collect_source_content_optimized(
+    session: AsyncSession,
+    conversation_id: str,
+) -> str:
+    """Optimized version of collect_source_content"""
+    
+    # Get conversation to get user_id
+    conv_query = select(Conversation).where(Conversation.id == conversation_id)
+    conv_result = await session.execute(conv_query)
+    conversation = conv_result.scalar_one_or_none()
+    
+    if not conversation:
+        raise ValueError("Conversation not found")
+    
+    # Use optimized query with relationship loading
+    chunks = await OptimizedQueries.get_citations_with_chunks_optimized(
+        session, conversation.user_id, limit=10
+    )
+    
+    # Process chunks with null checks
+    content_parts = []
+    total_tokens = 0
+    max_tokens = 4000  # Limit to prevent token overflow
+    
+    for chunk in chunks:
+        # Add null check for source_document
+        doc_name = chunk.source_document.filename if chunk.source_document else "Unknown Document"
+        chunk_text = f"Document: {doc_name}\nContent: {chunk.content}\n\n"
+        chunk_tokens = OptimizedQueries.count_tokens_optimized(chunk_text)
+        
+        if total_tokens + chunk_tokens > max_tokens:
+            break
+            
+        content_parts.append(chunk_text)
+        total_tokens += chunk_tokens
+    
+    return "".join(content_parts)
 
 
 async def collect_source_content(
@@ -200,10 +194,10 @@ async def collect_source_content(
     collected_content = []
     current_tokens = 0
 
-    # Collect all citations from the conversation
+    # Collect all citations from the conversation with null checks
     all_citations = []
     for msg in conversation_messages:
-        if msg.citations:
+        if msg.citations and isinstance(msg.citations, list):
             all_citations.extend(msg.citations)
 
     if all_citations:
@@ -280,15 +274,26 @@ async def generate_meditation_transcript(source_text: str) -> str:
         """
     )
 
-    transcript = await model.chat_async(transcript_prompt)
-    transcript = transcript.strip()
-    tu.logger.info(f"Generated transcript of length: {len(transcript)} characters")
-    return transcript
+    # Create a thread with the prompt
+    thread = tt.Thread(
+        tt.system("You are a meditation script writer who creates peaceful, calming meditation scripts."),
+        id="meditation_transcript"
+    )
+    
+    # Add the user message to the thread
+    thread.append(tt.Message(transcript_prompt, "user"))
+
+    response = await model.chat_async(thread)
+    
+    # Fix: Handle response properly whether it's a string or object
+    response_content = response.content if hasattr(response, 'content') else str(response)
+
+    return response_content
 
 
 async def generate_audio_from_transcript(transcript: str) -> bytes:
-    """Generate audio bytes from meditation transcript"""
-
+    """Generate audio from transcript using OpenAI TTS"""
+    
     model = get_llm("gpt-4o")
     audio_bytes = await model.text_to_speech_async(
         prompt=transcript,
@@ -296,11 +301,52 @@ async def generate_audio_from_transcript(transcript: str) -> bytes:
         model="gpt-4o-mini-tts",
         instructions="""
         For sound effects transcript has tags like [breathing], [pause], [silence], etc.
-        - For pauses use [pause] tag.
-        - For breathing use [breathing] tag.
-        - When has [silence], add 1 second of silence.
-        - When has [silence-n], add n seconds of silence.
+        Please follow these instructions:
+        - Speak in a calm, soothing voice
+        - Pause appropriately for breathing instructions
+        - Use natural pacing for meditation
+        - Maintain consistent volume and tone
         """,
     )
-    tu.logger.info(f"Generated audio of {len(audio_bytes)} bytes")
+    
     return audio_bytes
+
+
+async def compress_audio_to_mp3(audio_bytes: bytes) -> bytes:
+    """Compress audio bytes to MP3 format using FFmpeg"""
+    
+    # Create temporary files
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as input_file:
+        input_file.write(audio_bytes)
+        input_path = input_file.name
+
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as output_file:
+        output_path = output_file.name
+
+    try:
+        # Use FFmpeg to convert to MP3
+        cmd = [
+            "ffmpeg",
+            "-i", input_path,
+            "-c:a", "libmp3lame",
+            "-b:a", "128k",
+            "-y",  # Overwrite output
+            output_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        
+        # Read the compressed audio
+        with open(output_path, "rb") as f:
+            compressed_audio = f.read()
+        
+        return compressed_audio
+        
+    finally:
+        # Clean up temporary files
+        for temp_path in [input_path, output_path]:
+            try:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+            except Exception as e:
+                tu.logger.warning(f"Failed to cleanup {temp_path}: {e}")

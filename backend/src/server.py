@@ -3,7 +3,6 @@ from tuneapi import tu
 import os
 import asyncio
 from fastapi import FastAPI, Depends
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import async_sessionmaker
