@@ -17,7 +17,7 @@ from src.content.image import _generate_image, CONTEMPLATION_PROMPTS
 from src.settings import get_supabase_client, get_llm
 from src.db import get_db_session, get_db_session_for_background
 from src.content.audio import (
-    collect_source_content,
+    collect_source_content_optimized,  # ✅ Changed to optimized version
     generate_meditation_transcript,
     generate_audio_from_transcript,
 )
@@ -87,7 +87,7 @@ async def generate_video_parallel(
         raise ValueError(f"Conversation with id {conversation_id} not found")
 
     # Step 2: Start source content collection and image generation in parallel
-    source_content_task = collect_source_content(session, conversation_id)
+    source_content_task = collect_source_content_optimized(session, conversation_id)  # ✅ Changed to optimized
     image_task = _generate_image_parallel()
     
     # Step 3: Wait for source content, then start transcript generation
