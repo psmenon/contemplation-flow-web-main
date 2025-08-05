@@ -18,7 +18,7 @@ from src.db import (
 from src.content.image import _generate_image, CONTEMPLATION_PROMPTS
 from src.settings import get_supabase_client, get_llm
 from src.content.audio import (
-    collect_source_content,
+    collect_source_content_optimized,  # ✅ Changed to optimized version
     generate_meditation_transcript,
     generate_audio_from_transcript,
 )
@@ -94,7 +94,7 @@ class ParallelVideoGenerator:
         self, session: AsyncSession, conversation_id: str
     ) -> str:
         """Generate source content for transcript"""
-        return await collect_source_content(session, conversation_id)
+        return await collect_source_content_optimized(session, conversation_id)  # ✅ Changed to optimized
 
     async def _generate_image_prompt(self) -> str:
         """Generate image prompt"""
