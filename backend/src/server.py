@@ -4,6 +4,7 @@ import os
 import asyncio
 from fastapi import FastAPI, Depends
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
