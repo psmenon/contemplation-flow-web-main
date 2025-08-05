@@ -8,6 +8,7 @@ from tuneapi import tt, tu
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
+from sqlalchemy.orm import selectinload
 from supabase import Client
 
 from src.db import (
@@ -19,7 +20,7 @@ from src.db import (
     DocumentChunk,
 )
 from src.settings import get_llm, get_supabase_client
-from src.db import get_db_session
+from src.db import get_db_session, get_db_session_for_background
 # Import the optimized queries
 from src.db import OptimizedQueries
 
@@ -33,44 +34,41 @@ async def generate_audio_content(
 ) -> None:
     """Background task to generate audio content and update the database record"""
 
-    # Create a new database session for the background task
-    session = get_db_session()
     spb_client = get_supabase_client()
 
-    try:
-        tu.logger.info(f"Starting background audio generation for content {content_id}")
+    async for session in get_db_session_for_background():
+        try:
+            tu.logger.info(f"Starting background audio generation for content {content_id}")
 
-        # Generate the audio content
-        content_path, transcript = await generate_audio_sync(
-            session=session,
-            conversation_id=conversation_id,
-            message_id=message_id,
-            spb_client=spb_client,
-            content_id=content_id,
-        )
-
-        # Update the ContentGeneration record with the results
-        query = select(ContentGeneration).where(ContentGeneration.id == content_id)
-        result = await session.execute(query)
-        content_generation = result.scalar_one_or_none()
-
-        if content_generation:
-            content_generation.content_path = content_path
-            content_generation.transcript = transcript
-            await session.commit()
-            tu.logger.info(
-                f"Successfully completed audio generation for content {content_id}"
+            # Generate the audio content
+            content_path, transcript = await generate_audio_sync(
+                session=session,
+                conversation_id=conversation_id,
+                message_id=message_id,
+                spb_client=spb_client,
+                content_id=content_id,
             )
-        else:
-            tu.logger.error(f"ContentGeneration record not found for id {content_id}")
 
-    except Exception as e:
-        tu.logger.error(
-            f"Error in background audio generation for content {content_id}: {e}"
-        )
-        # Could optionally update the record with an error status here
-    finally:
-        await session.close()
+            # Update the ContentGeneration record with the results
+            query = select(ContentGeneration).where(ContentGeneration.id == content_id)
+            result = await session.execute(query)
+            content_generation = result.scalar_one_or_none()
+
+            if content_generation:
+                content_generation.content_path = content_path
+                content_generation.transcript = transcript
+                await session.commit()
+                tu.logger.info(
+                    f"Successfully completed audio generation for content {content_id}"
+                )
+            else:
+                tu.logger.error(f"ContentGeneration record not found for id {content_id}")
+
+        except Exception as e:
+            tu.logger.error(
+                f"Error in background audio generation for content {content_id}: {e}"
+            )
+            raise
 
 
 async def generate_audio_sync(
@@ -101,20 +99,7 @@ async def generate_audio_sync(
         op.finish(transcript_length=len(transcript))
     
     async with profile_operation("audio_generation") as op:
-        model = get_llm("gpt-4o")
-        audio_bytes = await model.text_to_speech_async(
-            prompt=transcript,
-            voice="shimmer",
-            model="gpt-4o-mini-tts",
-            instructions="""
-            For sound effects transcript has tags like [breathing], [pause], [silence], etc.
-            Please follow these instructions:
-            - Speak in a calm, soothing voice
-            - Pause appropriately for breathing instructions
-            - Use natural pacing for meditation
-            - Maintain consistent volume and tone
-            """,
-        )
+        audio_bytes = await generate_audio_from_transcript(transcript)
         op.finish(audio_size_bytes=len(audio_bytes))
     
     async with profile_operation("audio_compression") as op:
@@ -138,7 +123,7 @@ async def collect_source_content_optimized(
     session: AsyncSession,
     conversation_id: str,
 ) -> str:
-    """Optimized version of collect_source_content"""
+    """Optimized version of collect_source_content - FIXED FOR SHARED DOCUMENTS"""
     
     # Get conversation to get user_id
     conv_query = select(Conversation).where(Conversation.id == conversation_id)
@@ -148,10 +133,17 @@ async def collect_source_content_optimized(
     if not conversation:
         raise ValueError("Conversation not found")
     
-    # Use optimized query with relationship loading
-    chunks = await OptimizedQueries.get_citations_with_chunks_optimized(
-        session, conversation.user_id, limit=10
+    # Get random chunks without user filtering since documents are shared
+    query = (
+        select(DocumentChunk)
+        .join(SourceDocument)
+        .options(selectinload(DocumentChunk.source_document))
+        .where(SourceDocument.active == True)
+        .order_by(func.random())
+        .limit(10)
     )
+    result = await session.execute(query)
+    chunks = result.scalars().all()
     
     # Process chunks with null checks
     content_parts = []

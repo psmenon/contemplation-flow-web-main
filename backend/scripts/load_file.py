@@ -72,6 +72,7 @@ async def _main(fp: str):
             file_size_bytes=file_size,
             status=DocumentStatus.PROCESSING,
             active=True,
+            # Remove user_id since documents are now shared
         )
         session.add(source_doc)
         await session.flush()  # To get the ID

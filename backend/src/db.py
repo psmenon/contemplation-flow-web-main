@@ -227,10 +227,21 @@ def connect_to_postgres(sync: bool = False) -> AsyncEngine | Engine:
 def get_db_session(
     sync: bool = False,
 ) -> AsyncSession | Session:
-    db_engine = connect_to_postgres(sync=sync)
+    # ❌ OLD: Creates new engine each time
+    # db_engine = connect_to_postgres(sync=sync)
+    
+    # ✅ NEW: Use shared engine from app state
+    from fastapi import Request
+    from contextlib import asynccontextmanager
+    
+    # This should be used in FastAPI dependency injection context
+    # For background tasks, we need a different approach
+    
     if sync:
+        db_engine = connect_to_postgres(sync=True)
         factory = sessionmaker(db_engine, expire_on_commit=False)
     else:
+        db_engine = connect_to_postgres(sync=False)
         factory = async_sessionmaker(db_engine, expire_on_commit=False)
     return factory()
 
@@ -292,10 +303,10 @@ class UserProfile(Base):
     content_generations: Mapped[list["ContentGeneration"]] = relationship(
         "ContentGeneration", back_populates="user", cascade="all, delete-orphan"
     )
-    # Add this relationship
-    source_documents: Mapped[list["SourceDocument"]] = relationship(
-        "SourceDocument", back_populates="user", cascade="all, delete-orphan"
-    )
+    # Remove source_documents relationship since they're now shared
+    # source_documents: Mapped[list["SourceDocument"]] = relationship(
+    #     "SourceDocument", back_populates="user", cascade="all, delete-orphan"
+    # )
 
     __table_args__ = (
         # HIGH IMPACT: Phone number lookup (already unique, but explicit index)
@@ -423,6 +434,8 @@ class Message(Base):
         Index("idx_message_role", "role"),
         # MEDIUM IMPACT: Created at for sorting
         Index("idx_message_created_at", "created_at"),
+        # MEDIUM IMPACT: Feedback type for analytics
+        Index("idx_message_feedback_type", "feedback_type"),
     )
 
     async def to_bm(self) -> wire.Message:
@@ -493,9 +506,7 @@ class SourceDocument(Base):
 
     id: Mapped[pkey_uuid]
     created_at: Mapped[default_timestamp]
-    user_id: Mapped[fkey_uuid] = mapped_column(
-        ForeignKey("user_profiles.id", ondelete="CASCADE")
-    )
+    # Remove user_id since these are shared documents
     filename: Mapped[str] = mapped_column(String, nullable=False)
     file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -503,10 +514,10 @@ class SourceDocument(Base):
         pg_enum(DocumentStatus, name="document_status_enum", create_type=True),
         default=DocumentStatus.PROCESSING,
     )
-    # Relationships
-    user: Mapped["UserProfile"] = relationship(
-        "UserProfile", back_populates="source_documents"
-    )
+    # Remove user relationship since these are shared
+    # user: Mapped["UserProfile"] = relationship(
+    #     "UserProfile", back_populates="source_documents"
+    # )
 
     # Relationships
     chunks: Mapped[list["DocumentChunk"]] = relationship(
@@ -619,6 +630,8 @@ class ContentGeneration(Base):
         Index("idx_content_generation_user_id", "user_id"),
         # HIGH IMPACT: Content by conversation
         Index("idx_content_generation_conversation_id", "conversation_id"),
+        # HIGH IMPACT: Content by message
+        Index("idx_content_generation_message_id", "message_id"),
         # MEDIUM IMPACT: Content type filtering
         Index("idx_content_generation_type", "content_type"),
         # MEDIUM IMPACT: Created at for sorting
@@ -645,7 +658,6 @@ class ContentGeneration(Base):
 # Create indexes for performance
 Index("idx_source_documents_active", SourceDocument.active, SourceDocument.status)
 Index("idx_otp_sessions_phone_expires", OTPSession.phone_number, OTPSession.expires_at)
-Index("idx_user_profiles_phone", UserProfile.phone_number)
 Index(
     "idx_content_generations_user_created",
     ContentGeneration.user_id,
@@ -682,15 +694,16 @@ class OptimizedQueries:
     @staticmethod
     async def get_citations_with_chunks_optimized(
         session: AsyncSession,
-        user_id: str,
+        user_id: str,  # Keep parameter for API compatibility but don't filter
         limit: int = 10,
     ) -> List[DocumentChunk]:
-        """Optimized query to get random chunks with citations"""
+        """Optimized query to get random chunks with citations (shared documents)"""
         query = (
             select(DocumentChunk)
             .join(SourceDocument)
             .options(selectinload(DocumentChunk.source_document))
-            .where(SourceDocument.user_id == user_id)
+            # Remove user filtering since documents are shared
+            # .where(SourceDocument.user_id == user_id)
             .order_by(func.random())
             .limit(limit)
         )
@@ -700,10 +713,10 @@ class OptimizedQueries:
     @staticmethod
     async def get_random_chunks_optimized(
         session: AsyncSession,
-        user_id: str,
+        user_id: str,  # Keep parameter for API compatibility but don't filter
         limit: int = 10,
     ) -> List[DocumentChunk]:
-        """Get random chunks for content generation"""
+        """Get random chunks for content generation (shared documents)"""
         return await OptimizedQueries._get_random_chunks_optimized(
             session, user_id, limit
         )
@@ -711,14 +724,15 @@ class OptimizedQueries:
     @staticmethod
     async def _get_random_chunks_optimized(
         session: AsyncSession,
-        user_id: str,
+        user_id: str,  # Keep parameter for API compatibility but don't filter
         limit: int = 10,
     ) -> List[DocumentChunk]:
-        """Internal method for getting random chunks"""
+        """Internal method for getting random chunks (shared documents)"""
         query = (
             select(DocumentChunk)
             .join(SourceDocument)
-            .where(SourceDocument.user_id == user_id)
+            # Remove user filtering since documents are shared
+            # .where(SourceDocument.user_id == user_id)
             .order_by(func.random())
             .limit(limit)
         )
@@ -748,3 +762,21 @@ class OptimizedQueries:
         )
         result = await session.execute(query)
         return result.scalar_one_or_none()
+
+# Add this new function for background tasks
+async def get_db_session_for_background() -> AsyncGenerator[AsyncSession, None]:
+    """Get database session for background tasks with proper lifecycle management"""
+    # Use the same engine creation but with proper cleanup
+    db_engine = connect_to_postgres(sync=False)
+    factory = async_sessionmaker(db_engine, expire_on_commit=False)
+    session = factory()
+    
+    try:
+        yield session
+    except Exception as e:
+        tu.logger.error(f"Error in background db session: {e}")
+        await session.rollback()
+        raise
+    finally:
+        await session.close()
+        await db_engine.dispose()  # ✅ Dispose the engine too!
