@@ -12,6 +12,7 @@ interface InlineMeditationCreatorProps {
   conversationId?: string;
   messageId?: string;
   existingContentGenerations?: ContentGeneration[];
+  onContentGenerated?: () => void;
 }
 
 // Custom hook for polling content status
@@ -70,7 +71,8 @@ const InlineMeditationCreator = ({
   onClose,
   conversationId,
   messageId,
-  existingContentGenerations = []
+  existingContentGenerations = [],
+  onContentGenerated
 }: InlineMeditationCreatorProps) => {
   const [selectedLength, setSelectedLength] = useState("10 min");
   const [selectedFormat, setSelectedFormat] = useState("Audio");
@@ -111,8 +113,9 @@ const InlineMeditationCreator = ({
       setCurrentContentType(null);
       setIsInitiating(false);
       setError(null);
+      onContentGenerated?.(); // Call the prop callback
     }
-  }, [status, contentUrl]);
+  }, [status, contentUrl, onContentGenerated]);
 
   // Combine errors from initiation and polling
   const displayError = error || pollingError;

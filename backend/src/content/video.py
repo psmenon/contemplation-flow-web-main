@@ -15,7 +15,7 @@ from src.db import (
 )
 from src.content.image import _generate_image, CONTEMPLATION_PROMPTS
 from src.settings import get_supabase_client, get_llm
-from src.db import get_db_session
+from src.db import get_db_session, get_db_session_for_background
 from src.content.audio import (
     collect_source_content,
     generate_meditation_transcript,
@@ -31,44 +31,41 @@ async def generate_video_content(
 ) -> None:
     """Background task to generate video content and update the database record"""
 
-    # Create a new database session for the background task
-    session = get_db_session()
     spb_client = get_supabase_client()
 
-    try:
-        tu.logger.info(f"Starting background video generation for content {content_id}")
+    async for session in get_db_session_for_background():
+        try:
+            tu.logger.info(f"Starting background video generation for content {content_id}")
 
-        # Generate the video content using parallel processing
-        content_path, transcript = await generate_video_parallel(
-            session=session,
-            conversation_id=conversation_id,
-            message_id=message_id,
-            spb_client=spb_client,
-            content_id=content_id,
-        )
-
-        # Update the ContentGeneration record with the results
-        query = select(ContentGeneration).where(ContentGeneration.id == content_id)
-        result = await session.execute(query)
-        content_generation = result.scalar_one_or_none()
-
-        if content_generation:
-            content_generation.content_path = content_path
-            content_generation.transcript = transcript
-            await session.commit()
-            tu.logger.info(
-                f"Successfully completed video generation for content {content_id}"
+            # Generate the video content using parallel processing
+            content_path, transcript = await generate_video_parallel(
+                session=session,
+                conversation_id=conversation_id,
+                message_id=message_id,
+                spb_client=spb_client,
+                content_id=content_id,
             )
-        else:
-            tu.logger.error(f"ContentGeneration record not found for id {content_id}")
 
-    except Exception as e:
-        tu.logger.error(
-            f"Error in background video generation for content {content_id}: {e}"
-        )
-        # Could optionally update the record with an error status here
-    finally:
-        await session.close()
+            # Update the ContentGeneration record with the results
+            query = select(ContentGeneration).where(ContentGeneration.id == content_id)
+            result = await session.execute(query)
+            content_generation = result.scalar_one_or_none()
+
+            if content_generation:
+                content_generation.content_path = content_path
+                content_generation.transcript = transcript
+                await session.commit()
+                tu.logger.info(
+                    f"Successfully completed video generation for content {content_id}"
+                )
+            else:
+                tu.logger.error(f"ContentGeneration record not found for id {content_id}")
+
+        except Exception as e:
+            tu.logger.error(
+                f"Error in background video generation for content {content_id}: {e}"
+            )
+            raise
 
 
 async def generate_video_parallel(
@@ -203,14 +200,10 @@ def _create_video_ffmpeg_optimized(
 ) -> bool:
     """Optimized FFmpeg command for faster video creation"""
     
-    # Check for hardware acceleration
-    hw_accel = "-hwaccel auto" if _check_hardware_acceleration() else ""
-    
-    # Optimized settings for faster encoding
+    # Build command without hardware acceleration first
     cmd = [
         "ffmpeg",
         "-y",  # Overwrite output
-        hw_accel,
         "-loop", "1",  # Loop image
         "-i", image_path,
         "-i", audio_path,
@@ -223,6 +216,11 @@ def _create_video_ffmpeg_optimized(
         "-movflags", "+faststart",  # Web optimization
         output_path
     ]
+    
+    # Add hardware acceleration if available
+    if _check_hardware_acceleration():
+        cmd.insert(2, "-hwaccel")
+        cmd.insert(3, "auto")
     
     try:
         result = subprocess.run(

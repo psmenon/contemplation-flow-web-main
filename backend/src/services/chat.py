@@ -22,6 +22,26 @@ from src.utils.profiler import profile_operation, get_profiler, print_profiler_s
 from src.db import DocumentChunk, SourceDocument
 
 
+def generate_citation_url(filename: str, spb_client: Client) -> str:
+    """Generate a Supabase signed URL for a source file"""
+    try:
+        # Create a signed URL for the source file
+        presigned_response = spb_client.storage.from_("source-files").create_signed_url(
+            filename, 3600  # 1 hour expiry
+        )
+        
+        if presigned_response.get("error"):
+            # Fallback to a generic URL if signing fails
+            return f"https://mfzbpincchxrgqwagpjw.supabase.co/storage/v1/object/public/source-files/{filename}"
+        
+        return presigned_response.get("signedURL", "")
+        
+    except Exception as e:
+        tu.logger.warning(f"Failed to generate signed URL for {filename}: {e}")
+        # Fallback to public URL
+        return f"https://mfzbpincchxrgqwagpjw.supabase.co/storage/v1/object/public/source-files/{filename}"
+
+
 # Mock data and functions for testing
 async def _mock_llm_chat(
     session: AsyncSession,
@@ -66,11 +86,11 @@ async def _mock_llm_chat(
     mock_citations = [
         w.CitationInfo(
             name="spiritual_teachings.pdf",
-            url="https://mfzbpincchxrgqwagpjw.supabase.co/storage/v1/object/sign/source-files/Sadhanas-from-Devikalottara-Jnanachara-Vichara-Patalah.pdf?token=eyJraWQiOiJzdG9yYWdlLXVybC1zaWduaW5nLWtleV9jMTI5OWE2YS05ZWI4LTRkMGEtOGE5My03MGRhZTk1ZGMwNmMiLCJhbGciOiJIUzI1NiJ9.eyJ1cmwiOiJzb3VyY2UtZmlsZXMvU2FkaGFuYXMtZnJvbS1EZXZpa2Fsb3R0YXJhLUpuYW5hY2hhcmEtVmljaGFyYS1QYXRhbGFoLnBkZiIsImlhdCI6MTc1MTk5NzkwMSwiZXhwIjoxNzgzNTMzOTAxfQ.fAJDi47vDS72U5nm3dZ8kgz93l6VYWE0WcqIUrNwQGQ",
+            url=generate_citation_url("spiritual_teachings.pdf", spb_client),
         ),
         w.CitationInfo(
             name="meditation_guide.pdf",
-            url="https://mfzbpincchxrgqwagpjw.supabase.co/storage/v1/object/sign/source-files/Sadhanas-from-Devikalottara-Jnanachara-Vichara-Patalah.pdf?token=eyJraWQiOiJzdG9yYWdlLXVybC1zaWduaW5nLWtleV9jMTI5OWE2YS05ZWI4LTRkMGEtOGE5My03MGRhZTk1ZGMwNmMiLCJhbGciOiJIUzI1NiJ9.eyJ1cmwiOiJzb3VyY2UtZmlsZXMvU2FkaGFuYXMtZnJvbS1EZXZpa2Fsb3R0YXJhLUpuYW5hY2hhcmEtVmljaGFyYS1QYXRhbGFoLnBkZiIsImlhdCI6MTc1MTk5NzkwMSwiZXhwIjoxNzgzNTMzOTAxfQ.fAJDi47vDS72U5nm3dZ8kgz93l6VYWE0WcqIUrNwQGQ",
+            url=generate_citation_url("meditation_guide.pdf", spb_client),
         ),
     ]
 
@@ -224,7 +244,7 @@ async def _llm_chat(
         print(f"DEBUG: chunks found: {len(chunks)}")
         print(f"DEBUG: chunks content: {chunks}")
         citations = [
-            w.CitationInfo(name=filename, url=f"https://example.com/{filename}")
+            w.CitationInfo(name=filename, url=generate_citation_url(filename, spb_client))
             for _, filename in chunks[:3]
         ]
         print(f"DEBUG: citations created: {citations}")
@@ -319,7 +339,10 @@ async def _llm_chat_optimized(
         print(f"DEBUG: chunks found: {len(chunks)}")
         print(f"DEBUG: chunks content: {chunks}")
         citations = [
-            w.CitationInfo(name=filename, url=f"https://example.com/{filename}")
+            w.CitationInfo(
+                name=filename, 
+                url=generate_citation_url(filename, spb_client)
+            )
             for _, filename in chunks[:3]
         ]
         print(f"DEBUG: citations created: {citations}")
@@ -448,7 +471,10 @@ async def _llm_chat_streaming_optimized(
         print(f"DEBUG: chunks found: {len(chunks)}")
         print(f"DEBUG: chunks content: {chunks}")
         citations = [
-            w.CitationInfo(name=filename, url=f"https://example.com/{filename}")
+            w.CitationInfo(
+                name=filename, 
+                url=generate_citation_url(filename, spb_client)
+            )
             for _, filename in chunks[:3]
         ]
         print(f"DEBUG: citations created: {citations}")

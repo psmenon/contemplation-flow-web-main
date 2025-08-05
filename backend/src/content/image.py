@@ -78,44 +78,41 @@ async def generate_image_content(
 ) -> None:
     """Background task to generate image content and update the database record"""
 
-    # Create a new database session for the background task
-    session = get_db_session()
     spb_client = get_supabase_client()
 
-    try:
-        tu.logger.info(f"Starting background image generation for content {content_id}")
+    async for session in get_db_session_for_background():
+        try:
+            tu.logger.info(f"Starting background image generation for content {content_id}")
 
-        # Generate the image content
-        content_path, cc_text = await generate_contemplation_card_sync(
-            session=session,
-            conversation_id=conversation_id,
-            message_id=message_id,
-            spb_client=spb_client,
-            content_id=content_id,
-        )
-
-        # Update the ContentGeneration record with the results
-        query = select(ContentGeneration).where(ContentGeneration.id == content_id)
-        result = await session.execute(query)
-        content_generation = result.scalar_one_or_none()
-
-        if content_generation:
-            content_generation.content_path = content_path
-            content_generation.cc_text = cc_text
-            await session.commit()
-            tu.logger.info(
-                f"Successfully completed image generation for content {content_id}"
+            # Generate the image content
+            content_path, cc_text = await generate_contemplation_card_sync(
+                session=session,
+                conversation_id=conversation_id,
+                message_id=message_id,
+                spb_client=spb_client,
+                content_id=content_id,
             )
-        else:
-            tu.logger.error(f"ContentGeneration record not found for id {content_id}")
 
-    except Exception as e:
-        tu.logger.error(
-            f"Error in background image generation for content {content_id}: {e}"
-        )
-        # Could optionally update the record with an error status here
-    finally:
-        await session.close()
+            # Update the ContentGeneration record with the results
+            query = select(ContentGeneration).where(ContentGeneration.id == content_id)
+            result = await session.execute(query)
+            content_generation = result.scalar_one_or_none()
+
+            if content_generation:
+                content_generation.content_path = content_path
+                content_generation.cc_text = cc_text
+                await session.commit()
+                tu.logger.info(
+                    f"Successfully completed image generation for content {content_id}"
+                )
+            else:
+                tu.logger.error(f"ContentGeneration record not found for id {content_id}")
+
+        except Exception as e:
+            tu.logger.error(
+                f"Error in background image generation for content {content_id}: {e}"
+            )
+            raise
 
 
 async def generate_contemplation_card_sync(
