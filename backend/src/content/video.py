@@ -15,13 +15,14 @@ from src.db import (
 )
 from src.content.image import _generate_image, CONTEMPLATION_PROMPTS
 from src.settings import get_supabase_client, get_llm
-from src.db import get_db_session, get_db_session_for_background
+from src.db import get_db_session, get_background_session
 from src.content.audio import (
     collect_source_content_optimized,  # ✅ Changed to optimized version
     generate_meditation_transcript,
     generate_audio_from_transcript,
 )
 from src.content.parallel_video import parallel_generator
+from contextlib import asynccontextmanager
 
 
 async def generate_video_content(
@@ -33,7 +34,7 @@ async def generate_video_content(
 
     spb_client = get_supabase_client()
 
-    async for session in get_db_session_for_background():
+    async with get_background_session() as session:
         try:
             tu.logger.info(f"Starting background video generation for content {content_id}")
 
@@ -60,11 +61,14 @@ async def generate_video_content(
                 )
             else:
                 tu.logger.error(f"ContentGeneration record not found for id {content_id}")
+                # No changes were made, but ensure session is clean
+                await session.rollback()
 
         except Exception as e:
             tu.logger.error(
                 f"Error in background video generation for content {content_id}: {e}"
             )
+            # Session will be automatically rolled back by the context manager
             raise
 
 
@@ -75,66 +79,19 @@ async def generate_video_parallel(
     spb_client: Client,
     content_id: str,
 ) -> tuple[str, str]:
-    """Generate video content with parallel processing for maximum speed"""
+    """Generate video content with maximum parallelization and optimization"""
     
-    tu.logger.info(f"Starting parallel video generation for {content_id}")
+    tu.logger.info(f"Starting optimized parallel video generation for {content_id}")
     
-    # Step 1: Get conversation and start source content collection
-    query = select(Conversation).where(Conversation.id == conversation_id)
-    result = await session.execute(query)
-    conversation = result.scalar_one_or_none()
-    if not conversation:
-        raise ValueError(f"Conversation with id {conversation_id} not found")
-
-    # Step 2: Start source content collection and image generation in parallel
-    source_content_task = collect_source_content_optimized(session, conversation_id)  # ✅ Changed to optimized
-    image_task = _generate_image_parallel()
-    
-    # Step 3: Wait for source content, then start transcript generation
-    source_content = await source_content_task
-    transcript_task = generate_meditation_transcript(source_content)
-    
-    # Step 4: Wait for transcript, then start audio generation
-    transcript = await transcript_task
-    audio_task = generate_audio_from_transcript(transcript)
-    
-    # Step 5: Wait for image and audio to complete in parallel
-    image, audio_bytes = await asyncio.gather(
-        image_task,
-        audio_task,
-        return_exceptions=True
+    # Use the optimized parallel generator
+    content_path, transcript = await parallel_generator.generate_video_parallel_optimized(
+        session=session,
+        conversation_id=conversation_id,
+        message_id=message_id,
+        content_id=content_id,
     )
     
-    # Handle exceptions
-    if isinstance(image, Exception):
-        tu.logger.error(f"Image generation failed: {image}")
-        raise image
-    if isinstance(audio_bytes, Exception):
-        tu.logger.error(f"Audio generation failed: {audio_bytes}")
-        raise audio_bytes
-    
-    # Step 6: Create video with optimized FFmpeg
-    video_path = await _create_video_optimized(image, audio_bytes)
-    
-    # Step 7: Upload to Supabase
-    content_path = f"meditation-videos/{content_id}.mp4"
-    with open(video_path, "rb") as f:
-        video_bytes = f.read()
-    
-    tu.logger.info(f"Uploading video to supabase: {content_path}")
-    spb_client.storage.from_("generations").upload(
-        content_path,
-        video_bytes,
-        {"content-type": "video/mp4"},
-    )
-    
-    # Cleanup
-    try:
-        os.unlink(video_path)
-    except Exception as e:
-        tu.logger.warning(f"Failed to cleanup video temp file: {e}")
-    
-    tu.logger.info(f"Successfully completed parallel video generation: {content_id}")
+    tu.logger.info(f"Successfully completed optimized video generation: {content_id}")
     return content_path, transcript
 
 

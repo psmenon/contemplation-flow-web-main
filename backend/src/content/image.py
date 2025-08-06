@@ -20,7 +20,7 @@ from src.db import (
     DocumentChunk,
 )
 from src.settings import get_llm, get_supabase_client
-from src.db import get_db_session
+from src.db import get_db_session, get_background_session
 
 
 CONTEMPLATION_PROMPTS = [
@@ -80,7 +80,7 @@ async def generate_image_content(
 
     spb_client = get_supabase_client()
 
-    async for session in get_db_session_for_background():
+    async with get_background_session() as session:
         try:
             tu.logger.info(f"Starting background image generation for content {content_id}")
 
@@ -107,11 +107,14 @@ async def generate_image_content(
                 )
             else:
                 tu.logger.error(f"ContentGeneration record not found for id {content_id}")
+                # No changes were made, but ensure session is clean
+                await session.rollback()
 
         except Exception as e:
             tu.logger.error(
                 f"Error in background image generation for content {content_id}: {e}"
             )
+            # Session will be automatically rolled back by the context manager
             raise
 
 
