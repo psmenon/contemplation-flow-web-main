@@ -41,6 +41,16 @@ class Settings(BaseSettings):
     # mode
     echo_db: bool = False
 
+    # Performance optimization settings
+    content_generation_timeout: int = 300  # 5 minutes for content generation
+    audio_compression_timeout: int = 60   # 1 minute for audio compression
+    video_encoding_timeout: int = 120     # 2 minutes for video encoding
+    cache_ttl: int = 3600                # 1 hour cache TTL
+    max_parallel_tasks: int = 4          # Maximum parallel tasks
+    enable_hardware_acceleration: bool = True  # Enable hardware acceleration
+    use_caching: bool = True              # Enable caching
+    optimize_for_speed: bool = True       # Optimize for speed over quality
+
     def is_valid_upload_extension(self, extension: str) -> bool:
         return extension.lower() in self.allowed_upload_extensions.split("/")
 

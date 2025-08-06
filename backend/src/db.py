@@ -205,21 +205,27 @@ def connect_to_postgres(sync: bool = False) -> AsyncEngine | Engine:
     ssl_context = create_default_context()
     ssl_context.check_hostname = False
     ssl_context.verify_mode = settings.prod  # Set to True in production
+    
+    # Enhanced connection pool settings to prevent leaks
+    pool_settings = {
+        "pool_size": 5,          # Number of connections to maintain in pool
+        "max_overflow": 10,      # Additional connections allowed beyond pool_size
+        "pool_timeout": 30,      # Seconds to wait for connection from pool
+        "pool_recycle": 3600,    # Recycle connections every hour
+        "pool_pre_ping": True,   # Verify connections before use
+        "echo": settings.echo_db,
+        "echo_pool": settings.echo_db,  # Only echo pool events if echo_db is True
+    }
+    
     if sync:
         return create_engine(
             str(settings.db_url),
-            echo=settings.echo_db,
-            echo_pool=True,
-            pool_pre_ping=True,
-            pool_recycle=3600,  # Recycle connections every hour
+            **pool_settings,
             #connect_args={"ssl": ssl_context},
         )
     return create_async_engine(
         str(settings.db_url),
-        echo=settings.echo_db,
-        echo_pool=True,
-        pool_pre_ping=True,
-        pool_recycle=3600,  # Recycle connections every hour
+        **pool_settings,
         #connect_args={"ssl": ssl_context},
     )
 
@@ -227,10 +233,10 @@ def connect_to_postgres(sync: bool = False) -> AsyncEngine | Engine:
 def get_db_session(
     sync: bool = False,
 ) -> AsyncSession | Session:
-    # ❌ OLD: Creates new engine each time
+    
     # db_engine = connect_to_postgres(sync=sync)
     
-    # ✅ NEW: Use shared engine from app state
+    # Use shared engine from app state
     from fastapi import Request
     from contextlib import asynccontextmanager
     
@@ -262,8 +268,6 @@ async def get_db_session_fa(request: Request) -> AsyncGenerator[AsyncSession, No
             tu.logger.error(f"Error in db session: {e}")
             await session.rollback()
             raise  # Re-raise the exception so FastAPI can handle it properly
-        finally:
-            await session.close()
     finally:
         await session.close()
 
@@ -764,19 +768,61 @@ class OptimizedQueries:
         return result.scalar_one_or_none()
 
 # Add this new function for background tasks
-async def get_db_session_for_background() -> AsyncGenerator[AsyncSession, None]:
-    """Get database session for background tasks with proper lifecycle management"""
-    # Use the same engine creation but with proper cleanup
-    db_engine = connect_to_postgres(sync=False)
+from contextlib import asynccontextmanager
+
+# Global engine instance for background tasks
+_background_engine = None
+
+def get_background_engine():
+    """Get or create the background engine"""
+    global _background_engine
+    if _background_engine is None:
+        _background_engine = connect_to_postgres(sync=False)
+    return _background_engine
+
+@asynccontextmanager
+async def get_background_session():
+    """Async context manager for background database sessions"""
+    import time
+    session_id = f"bg_session_{int(time.time() * 1000)}"
+    tu.logger.debug(f"[{session_id}] Creating background session")
+    
+    # Reuse the global background engine instead of creating new ones
+    db_engine = get_background_engine()
     factory = async_sessionmaker(db_engine, expire_on_commit=False)
     session = factory()
     
     try:
         yield session
+        tu.logger.debug(f"[{session_id}] Session completed successfully")
     except Exception as e:
-        tu.logger.error(f"Error in background db session: {e}")
-        await session.rollback()
+        tu.logger.error(f"[{session_id}] Session error: {e}")
+        try:
+            await session.rollback()
+            tu.logger.debug(f"[{session_id}] Session rolled back")
+        except Exception as rollback_error:
+            tu.logger.error(f"[{session_id}] Rollback failed: {rollback_error}")
         raise
     finally:
-        await session.close()
-        await db_engine.dispose()  # ✅ Dispose the engine too!
+        await session.close()  # Only close session
+        
+        
+
+async def dispose_background_engine():
+    """Dispose of the background engine during application shutdown"""
+    global _background_engine
+    if _background_engine is not None:
+        try:
+            await _background_engine.dispose()
+            tu.logger.info("Background engine disposed successfully")
+        except Exception as e:
+            tu.logger.error(f"Failed to dispose background engine: {e}")
+        finally:
+            _background_engine = None
+
+# Keep the old function for backward compatibility but mark as deprecated
+async def get_db_session_for_background() -> AsyncGenerator[AsyncSession, None]:
+    """DEPRECATED: Use get_background_session() context manager instead"""
+    tu.logger.warning("Using deprecated get_db_session_for_background - switch to get_background_session()")
+    async with get_background_session() as session:
+        yield session

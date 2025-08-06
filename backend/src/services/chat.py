@@ -240,15 +240,10 @@ async def _llm_chat(
         await session.refresh(ai_message)
         
         # Add citations - USE ORIGINAL PYDANTIC MODELS
-        # Add debugging to see what's happening with citations
-        print(f"DEBUG: chunks found: {len(chunks)}")
-        print(f"DEBUG: chunks content: {chunks}")
         citations = [
             w.CitationInfo(name=filename, url=generate_citation_url(filename, spb_client))
             for _, filename in chunks[:3]
         ]
-        print(f"DEBUG: citations created: {citations}")
-        print(f"DEBUG: citation model_dump: {[c.model_dump() for c in citations]}") 
         ai_message.citations = citations  # Direct assignment
         
         # Generate follow-up questions - USE ORIGINAL PYDANTIC MODELS
@@ -271,11 +266,9 @@ async def _llm_chat(
     yield ta.to_openai_chunk(tt.assistant(f"<message_id>{ai_message.id}</message_id>"))
 
     # Yield citations
-    print(f"DEBUG: Yielding citations: {citations}")
     yield ta.to_openai_chunk(tt.assistant(f"<citations>"))
     for c in citations:
         citation_json = tu.to_json(c.model_dump(), tight=True)
-        print(f"DEBUG: Yielding citation: {citation_json}")
         yield ta.to_openai_chunk(tt.assistant(citation_json))
     yield ta.to_openai_chunk(tt.assistant("</citations>"))
     
@@ -336,8 +329,6 @@ async def _llm_chat_optimized(
         )
         
         # Add citations - REMOVE JSONB CONVERSION
-        print(f"DEBUG: chunks found: {len(chunks)}")
-        print(f"DEBUG: chunks content: {chunks}")
         citations = [
             w.CitationInfo(
                 name=filename, 
@@ -345,8 +336,6 @@ async def _llm_chat_optimized(
             )
             for _, filename in chunks[:3]
         ]
-        print(f"DEBUG: citations created: {citations}")
-        print(f"DEBUG: citation model_dump: {[c.model_dump() for c in citations]}")
         ai_message.citations = citations
 
         # Add follow-up questions - REMOVE JSONB CONVERSION
@@ -468,8 +457,6 @@ async def _llm_chat_streaming_optimized(
         )
         
         # Add citations - CONVERT TO JSONB
-        print(f"DEBUG: chunks found: {len(chunks)}")
-        print(f"DEBUG: chunks content: {chunks}")
         citations = [
             w.CitationInfo(
                 name=filename, 
@@ -477,8 +464,6 @@ async def _llm_chat_streaming_optimized(
             )
             for _, filename in chunks[:3]
         ]
-        print(f"DEBUG: citations created: {citations}")
-        print(f"DEBUG: citation model_dump: {[c.model_dump() for c in citations]}")
         ai_message.citations = citations
         
         # Generate follow-up questions - CONVERT TO JSONB

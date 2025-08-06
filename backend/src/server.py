@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from src import db, middlewares
+from src.db import dispose_background_engine
 from src.services import (
     admin as admin_svc,
     audio as audio_svc,
@@ -17,6 +18,7 @@ from src.services import (
     content as content_svc,
 )
 from src.dependencies import check_ffmpeg, get_api_token
+from src.content.parallel_video import pre_generate_common_images
 
 
 async def _setup_db(app: FastAPI):
@@ -26,11 +28,25 @@ async def _setup_db(app: FastAPI):
     app.state.db_engine = db_engine
     app.state.db_session_factory = session_factory
 
+async def _setup_optimizations(app: FastAPI):
+    """Setup performance optimizations"""
+    tu.logger.info("Setting up performance optimizations...")
+    
+    # Pre-generate common meditation images for faster video generation
+    try:
+        await pre_generate_common_images()
+        tu.logger.info("Performance optimizations setup complete")
+    except Exception as e:
+        tu.logger.error(f"Failed to setup optimizations: {e}")
+        # Don't fail startup if optimizations fail
 
 async def _close_db(app: FastAPI):
     tu.logger.info("Closing the database")
     db_engine = app.state.db_engine
     await db_engine.dispose()
+    
+    # Also dispose the background engine
+    await dispose_background_engine()
 
 
 # The app itself
@@ -40,10 +56,28 @@ async def _close_db(app: FastAPI):
 async def lifespan(app: FastAPI):
     # Setup
     await _setup_db(app)
+    # Don't pre-generate images at startup - too slow!
+    # await _setup_optimizations(app)
+    
+    # Start background pre-generation after server is up
+    asyncio.create_task(background_image_pregeneration())
+    
     yield
 
     # Cleanup
     await _close_db(app)
+
+async def background_image_pregeneration():
+    """Pre-generate images in background after server startup"""
+    # Wait a bit for server to fully start
+    await asyncio.sleep(30)  # Wait 30 seconds after startup
+    
+    try:
+        tu.logger.info("Starting background image pre-generation...")
+        await pre_generate_common_images()
+    except Exception as e:
+        tu.logger.error(f"Background image pre-generation failed: {e}")
+        # Don't crash the server if this fails
 
 
 def get_app() -> FastAPI:
