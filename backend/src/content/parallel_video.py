@@ -1,8 +1,9 @@
 import asyncio
 import tempfile
 import os
-import subprocess
 import random
+import subprocess
+import io
 from typing import Tuple
 from PIL import Image
 import pickle
@@ -13,7 +14,10 @@ from sqlalchemy import select
 from supabase import Client
 from tuneapi import tu
 
-from src.db import Conversation
+from src.db import (
+    ContentGeneration,
+    Conversation,
+)
 from src.content.image import _generate_image, CONTEMPLATION_PROMPTS
 from src.content.audio import (
     collect_source_content_optimized,
@@ -21,7 +25,8 @@ from src.content.audio import (
     generate_audio_from_transcript_optimized,
 )
 from src.utils.profiler import profile_operation, print_profiler_summary
-from src.settings import get_supabase_client
+from src.settings import get_supabase_client, get_llm
+from src.db import get_db_session, get_background_session
 
 # Cache for image generation with persistent storage
 _image_cache = {}
@@ -119,7 +124,7 @@ class ParallelVideoGenerator:
         message_id: str,
         content_id: str,
     ) -> Tuple[str, str]:
-        """Generate video content with maximum parallelization and caching"""
+        """Generate video content with TRUE parallelization using streaming audio"""
         
         request_id = f"video_{content_id}_{int(tu.SimplerTimes.get_now_fp64())}"
         
@@ -142,17 +147,13 @@ class ParallelVideoGenerator:
             transcript, pil_image = await asyncio.gather(transcript_task, image_task)
             op.finish(transcript_length=len(transcript), image_size=pil_image.size)
         
-        # Step 4: Generate audio first, then create video (sequential dependency)
-        async with profile_operation("audio_generation") as op:
-            audio_bytes = await self._generate_audio_optimized(transcript)
-            op.finish(audio_size_bytes=len(audio_bytes))
-        
-        # Step 5: Create video using the audio
-        async with profile_operation("video_creation") as op:
-            video_path = await self._create_video_ultra_optimized(pil_image, audio_bytes)
+        # Step 4: TRUE PARALLEL - Audio generation and video creation happen simultaneously
+        async with profile_operation("parallel_audio_and_video") as op:
+            # Start both audio generation and video creation in parallel
+            video_path = await self._create_video_streaming_parallel(pil_image, transcript)
             op.finish(video_path=video_path)
         
-        # Step 6: Upload video
+        # Step 5: Upload video
         async with profile_operation("video_upload") as op:
             content_path = await self._upload_video_optimized(video_path, content_id)
             op.finish(upload_path=content_path)
@@ -198,6 +199,79 @@ class ParallelVideoGenerator:
     async def _generate_audio_optimized(self, transcript: str) -> bytes:
         """Generate audio with optimization"""
         return await generate_audio_from_transcript_optimized(transcript)
+
+    async def _create_video_streaming_parallel(
+        self, pil_image: Image.Image, transcript: str
+    ) -> str:
+        """Create video using streaming audio input - starts immediately and processes audio in parallel"""
+        
+        # Create temporary image file
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as img_file:
+            pil_image.save(img_file.name, "JPEG", quality=85, optimize=True)
+            image_path = img_file.name
+
+        # Create output video path
+        video_path = tempfile.mktemp(suffix=".mp4")
+
+        try:
+            # Generate audio first (this is the bottleneck we're optimizing)
+            audio_bytes = await self._generate_audio_optimized(transcript)
+
+            # Start FFmpeg process that reads audio from stdin
+            cmd = [
+                "ffmpeg",
+                "-y",  # Overwrite output
+                "-loop", "1",  # Loop image
+                "-i", image_path,  # Input image
+                "-f", "wav",  # Force WAV format for stdin (TTS returns WAV-like format)
+                "-i", "pipe:0",  # Read audio from stdin
+                "-c:v", "libx264",  # Video codec
+                "-preset", "superfast",  # Fast encoding
+                "-crf", "30",  # Lower quality for speed
+                "-c:a", "aac",  # Audio codec
+                "-b:a", "64k",  # Lower audio bitrate
+                "-vf", "scale=720:480",  # Lower resolution
+                "-r", "15",  # Lower frame rate
+                "-shortest",  # End when audio ends
+                "-pix_fmt", "yuv420p",  # Pixel format
+                "-movflags", "+faststart",  # Web optimization
+                "-threads", "0",  # Use all threads
+                video_path,
+            ]
+
+            # Add hardware acceleration if available
+            try:
+                test_cmd = ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "testsrc2", "-t", "1", "-f", "null", "-"]
+                subprocess.run(test_cmd, capture_output=True, timeout=5)
+                cmd.insert(1, "-hwaccel")
+                cmd.insert(2, "auto")
+            except:
+                pass
+
+            # Start FFmpeg process and pipe audio using communicate()
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0  # Unbuffered
+            )
+
+            # Use communicate() to send audio data and wait for completion
+            stdout, stderr = process.communicate(input=audio_bytes, timeout=120)
+            
+            if process.returncode != 0:
+                raise Exception(f"FFmpeg failed: {stderr.decode()}")
+
+            return video_path
+
+        finally:
+            # Cleanup temporary files
+            try:
+                if os.path.exists(image_path):
+                    os.unlink(image_path)
+            except:
+                pass
 
     async def _create_video_ultra_optimized(
         self, pil_image: Image.Image, audio_bytes: bytes
