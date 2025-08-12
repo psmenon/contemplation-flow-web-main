@@ -4,7 +4,7 @@ services:
     env: python
     plan: starter
     buildCommand: |
-      cd backend && uv sync --no-cache --frozen
+      cd backend && pip install -e .
       cd ../frontend && npm install && npm run build
       cd ../backend
     startCommand: uvicorn src.server:get_app --host 0.0.0.0 --port $PORT --factory
