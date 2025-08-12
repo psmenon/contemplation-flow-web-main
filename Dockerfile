@@ -1,7 +1,7 @@
 # Stage 1: Build the frontend
 FROM node:18-alpine AS frontend-builder
 
-WORKDIR /app
+WORKDIR /frontend
 
 # Copy frontend package files
 COPY frontend/package*.json ./
@@ -54,7 +54,7 @@ COPY backend/alembic ./alembic
 COPY backend/src ./src
 
 # Copy the built frontend from the first stage
-COPY --from=frontend-builder /app/dist ./src/ui
+COPY --from=frontend-builder /frontend/dist ./src/ui
 
 # Change ownership to non-root user
 RUN chown -R appuser:appuser /app
