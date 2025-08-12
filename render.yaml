@@ -5,9 +5,9 @@ services:
     region: oregon
     plan: starter
     buildCommand: |
-      pip install -r requirements.txt
-      cd frontend && npm install && npm run build
-    startCommand: uvicorn src.server:get_app --host 0.0.0.0 --port $PORT --factory
+      cd backend && pip install -e .
+      cd ../frontend && npm install && npm run build
+    startCommand: cd backend && uvicorn src.server:get_app --host 0.0.0.0 --port $PORT --factory
     envVars:
       - key: ASAM_DB_URL
         value: postgresql+asyncpg://postgres:nejqij-0xygxi-kogHir@db.mfzbpincchxrgqwagpjw.supabase.co:5432/postgres
