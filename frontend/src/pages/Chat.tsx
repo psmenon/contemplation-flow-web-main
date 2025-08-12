@@ -372,7 +372,6 @@ const Chat = () => {
           conversationId={conversationId}
           messageId={messages.filter(msg => !msg.isUser).pop()?.id}
           existingContentGenerations={conversationDetail?.content_generations?.filter(cg => cg.content_type === 'audio' || cg.content_type === 'video') || []}
-          onContentGenerated={() => loadConversationData()}
         />
       </div>
 
