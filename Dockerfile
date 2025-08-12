@@ -37,6 +37,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
+# Configure DNS for external connectivity
+RUN echo "nameserver 8.8.8.8" > /etc/resolv.conf && \
+    echo "nameserver 8.8.4.4" >> /etc/resolv.conf
+
 # Create a non-root user for security
 RUN useradd --create-home --shell /bin/bash appuser
 

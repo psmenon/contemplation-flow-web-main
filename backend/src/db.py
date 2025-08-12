@@ -221,12 +221,12 @@ def connect_to_postgres(sync: bool = False) -> AsyncEngine | Engine:
         return create_engine(
             str(settings.db_url),
             **pool_settings,
-            #connect_args={"ssl": ssl_context},
+            connect_args={"ssl": ssl_context},
         )
     return create_async_engine(
         str(settings.db_url),
         **pool_settings,
-        #connect_args={"ssl": ssl_context},
+        connect_args={"ssl": ssl_context},
     )
 
 
