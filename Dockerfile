@@ -34,6 +34,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 # Install system dependencies required by your application
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user for security
@@ -62,7 +63,7 @@ RUN chown -R appuser:appuser /app
 # Switch to the non-root user
 USER appuser
 
-# Expose the port the application will run on
+# Expose the port
 EXPOSE 8000
 
 # Command to run the application

@@ -1,0 +1,41 @@
+services:
+  - type: web
+    name: contemplation-flow
+    env: python
+    plan: starter
+    buildCommand: |
+      cd backend && uv sync --no-cache --frozen
+      cd ../frontend && npm install && npm run build
+      cd ../backend
+    startCommand: uvicorn src.server:get_app --host 0.0.0.0 --port $PORT --factory
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: ASAM_ADMIN_DEFAULT_PASSWORD_LENGTH
+        sync: false
+      - key: ASAM_ALLOWED_UPLOAD_EXTENSIONS
+        sync: false
+      - key: ASAM_CHUNK_OVERLAP
+        sync: false
+      - key: ASAM_CHUNK_SIZE
+        sync: false
+      - key: ASAM_DB_URL
+        sync: false
+      - key: ASAM_ECHO_DB
+        sync: false
+      - key: ASAM_EMBEDDING_MODEL
+        sync: false
+      - key: ASAM_GENERATED_CONTENT_RETENTION_DAYS
+        sync: false
+      - key: ASAM_JWT_SECRET
+        sync: false
+      - key: ASAM_MAX_UPLOAD_FILE_SIZE
+        sync: false
+      - key: ASAM_OPENAI_TOKEN
+        sync: false
+      - key: ASAM_SUPABASE_KEY
+        sync: false
+      - key: ASAM_SUPABASE_URL
+        sync: false
+      - key: VITE_API_BASE_URL
+        sync: false 
