@@ -122,6 +122,12 @@ def get_app() -> FastAPI:
     app.add_api_route("/api/admin/source-data/list", admin_svc.list_source_data, methods=["GET"], tags=["admin"], dependencies=auth_dependency)
     # fmt: on
 
+    # Health check endpoint for Render.com
+    @app.get("/health")
+    async def health_check():
+        """Health check endpoint for Render.com monitoring"""
+        return {"status": "healthy", "timestamp": tu.now().isoformat()}
+
     # Catch-all route for SPA (Single Page Application) - must be last
     ui_path = tu.joinp(tu.folder(__file__), "ui")
     app.mount("/static", StaticFiles(directory=ui_path), name="static")
