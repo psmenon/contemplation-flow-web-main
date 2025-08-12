@@ -17,7 +17,12 @@ export default defineConfig(({ mode }) => ({
   ].filter(Boolean),
   resolve: {
     alias: {
-      "@": "./src",  // Use relative path instead of path.resolve
+      "@": path.resolve(__dirname, "src"),
+    },
+  },
+  build: {
+    rollupOptions: {
+      external: [],
     },
   },
 }));
