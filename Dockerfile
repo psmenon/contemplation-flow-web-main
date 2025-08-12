@@ -11,7 +11,7 @@ COPY frontend/bun.lockb ./
 RUN npm ci
 
 # Copy frontend source code
-COPY frontend/ ./
+COPY frontend/ .
 
 # Add before RUN npm run build
 ARG VITE_API_BASE_URL=https://arunachalasamudra.co.in/api

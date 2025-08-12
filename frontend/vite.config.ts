@@ -5,8 +5,7 @@ import { componentTagger } from "lovable-tagger";
 
 // https://vitejs.dev/config/
 export default defineConfig(({ mode }) => ({
-  // Comment out base for Docker builds to fix path resolution
-  // base: "/static/",
+  base: "/static/",
   server: {
     host: "::",
     port: 8080,
