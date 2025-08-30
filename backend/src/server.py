@@ -126,7 +126,7 @@ def get_app() -> FastAPI:
     @app.get("/health")
     async def health_check():
         """Health check endpoint for Render.com monitoring"""
-        return {"status": "healthy", "timestamp": tu.now().isoformat()}
+        return {"status": "healthy", "timestamp": tu.SimplerTimes.get_now_datetime().isoformat()}
 
     # Catch-all route for SPA (Single Page Application) - must be last
     ui_path = tu.joinp(tu.folder(__file__), "ui")
